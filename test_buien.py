@@ -263,6 +263,39 @@ class PlacesTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("Brugge · ", plain(out))
 
+    def test_places_lists_home_first(self):
+        run_main("--save", "work", "brussel")
+        run_main("--save", "gym", "leuven")
+        run_main("--home", "gent")
+        code, out, _ = run_main("--places")
+        self.assertEqual(code, 0)
+        self.assertEqual(out.splitlines(), [
+            "home  Gent (51.05, 3.72)",
+            "gym   Leuven (51.05, 3.72)",
+            "work  Brussel (51.05, 3.72)",
+        ])
+
+    def test_places_when_nothing_is_saved(self):
+        code, out, _ = run_main("--places")
+        self.assertEqual(code, 0)
+        self.assertIn("no saved places yet", out)
+
+    def test_forget(self):
+        run_main("--home", "gent")
+        run_main("--save", "work", "brussel")
+        code, _, err = run_main("--forget", "Work")
+        self.assertEqual(code, 0)
+        self.assertIn("forgot work", err)
+        self.assertEqual(sorted(buien.load_places()), ["home"])
+
+    def test_forget_an_unknown_place(self):
+        code, _, err = run_main("--forget", "work")
+        self.assertEqual(code, 1)
+        self.assertIn("no saved place called 'work'", err)
+        code, _, err = run_main("--forget")
+        self.assertEqual(code, 1)
+        self.assertIn("buien --forget work", err)
+
     def test_first_run_outside_a_terminal(self):
         with mock.patch.object(buien.sys.stdin, "isatty", return_value=False):
             code, _, err = run_main()

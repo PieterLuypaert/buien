@@ -6,11 +6,14 @@
   buien gent          somewhere else
   buien sint niklaas  a place name may be several words
   buien 51.05,3.72    coordinates
+  buien work          a place you saved under a name of your own
   buien --home gent   save Gent as home and show it right away
+  buien --save work brussel
+                      save Brussel as work, from then on: buien work
   buien --short       only the summary, for a status bar or prompt
   buien --json        the forecast as JSON, for scripts
 
-Home is kept in ~/.config/buien/home.json.
+Saved places, home among them, are kept in ~/.config/buien/places.json.
 Works in the Netherlands, Belgium and the border regions, as far as
 Buienradar's radar reaches. Colour is dropped with NO_COLOR or when the
 output is not a terminal.
@@ -38,6 +41,7 @@ ROWS = 3
 BLOCKS = " ▁▂▃▄▅▆▇█"
 COORDS = re.compile(r"^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$")
 ANSI = re.compile(r"\033\[[0-9;]*m")
+HOME = "home"
 
 Place = namedtuple("Place", "name lat lon")
 Slot = namedtuple("Slot", "time mm")
@@ -60,6 +64,7 @@ class BuienError(Exception):
 class Options:
     words: list = field(default_factory=list)
     home: bool = False
+    save: bool = False
     short: bool = False
     as_json: bool = False
     help: bool = False
@@ -105,27 +110,38 @@ def search_places(name):
     return (fetch_json(GEOCODE_URL + query) or {}).get("results") or []
 
 
-def home_file():
+def places_file():
     config = os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config"
-    return Path(config) / "buien" / "home.json"
+    return Path(config) / "buien" / "places.json"
 
 
-def load_home():
-    path = home_file()
+def load_places():
+    """Saved places by their lowercase name, home among them."""
+    path = places_file()
     if not path.exists():
-        return None
+        return {}
     try:
         data = json.loads(path.read_text())
-        return Place(data["name"], float(data["lat"]), float(data["lon"]))
-    except (OSError, ValueError, KeyError, TypeError) as error:
-        raise BuienError(f"{path} is unreadable ({error!r}), set home again with buien --home <place>") from error
+        return {name: Place(place["name"], float(place["lat"]), float(place["lon"])) for name, place in data.items()}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+        raise BuienError(f"{path} is unreadable ({error!r}), fix it or remove it and save your places again") from error
 
 
-def save_home(place):
-    path = home_file()
+def write_places(places):
+    path = places_file()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(place._asdict(), ensure_ascii=False) + "\n")
-    print(f"{place.name} is now home, from now on plain buien is enough", file=sys.stderr)
+    data = {name: place._asdict() for name, place in sorted(places.items())}
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+
+
+def save_place(name, place):
+    name = name.lower()
+    places = load_places()
+    places[name] = place
+    write_places(places)
+    shortcut = "plain buien" if name == HOME else f"buien {name}"
+    print(f"{place.name} is saved as {name}, from now on {shortcut} is enough", file=sys.stderr)
+    return place
 
 
 def ask_home():
@@ -137,20 +153,22 @@ def ask_home():
         name = ""
     if not name:
         raise BuienError("no place given")
-    place = lookup(name)
-    save_home(place)
-    return place
+    return save_place(HOME, lookup(name))
 
 
 def resolve_place(options):
-    if options.words:
-        place = lookup(" ".join(options.words))
-        if options.home:
-            save_home(place)
-        return place
+    text = " ".join(options.words)
+    if options.save:
+        if len(options.words) < 2:
+            raise BuienError("say a name and a place, e.g. buien --save work brussel")
+        return save_place(options.words[0], lookup(" ".join(options.words[1:])))
     if options.home:
-        raise BuienError("say which place is home, e.g. buien --home gent")
-    return load_home() or ask_home()
+        if not text:
+            raise BuienError("say which place is home, e.g. buien --home gent")
+        return save_place(HOME, lookup(text))
+    if text:
+        return load_places().get(text.lower()) or lookup(text)
+    return load_places().get(HOME) or ask_home()
 
 
 def fetch_forecast(place, now):
@@ -349,6 +367,8 @@ def parse_args(argv):
             options.help = True
         elif arg == "--home":
             options.home = True
+        elif arg == "--save":
+            options.save = True
         elif arg in ("-s", "--short"):
             options.short = True
         elif arg == "--json":

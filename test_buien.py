@@ -196,24 +196,22 @@ def run_main(*argv):
     return code, out.getvalue(), err.getvalue()
 
 
-class HomeTest(unittest.TestCase):
+class PlacesTest(unittest.TestCase):
     def setUp(self):
         config = tempfile.TemporaryDirectory()
         self.addCleanup(config.cleanup)
-        self.home_file = os.path.join(config.name, "buien", "home.json")
-        patches = [
-            mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": config.name}),
-            mock.patch.object(buien, "lookup", side_effect=lambda text: buien.Place(text.title(), 51.05, 3.72)),
-            mock.patch.object(buien, "fetch_forecast", return_value=slots(0, 0)),
-        ]
-        for patch in patches:
-            patch.start()
-            self.addCleanup(patch.stop)
+        self.places_file = os.path.join(config.name, "buien", "places.json")
+        self.lookup = mock.patch.object(
+            buien, "lookup", side_effect=lambda text: buien.Place(text.title(), 51.05, 3.72)
+        ).start()
+        mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": config.name}).start()
+        mock.patch.object(buien, "fetch_forecast", return_value=slots(0, 0)).start()
+        self.addCleanup(mock.patch.stopall)
 
     def test_home_is_remembered(self):
         code, _, err = run_main("--home", "gent")
         self.assertEqual(code, 0)
-        self.assertIn("Gent is now home", err)
+        self.assertIn("Gent is saved as home, from now on plain buien is enough", err)
         code, out, _ = run_main()
         self.assertEqual(code, 0)
         self.assertIn("Gent · ", plain(out))
@@ -221,12 +219,49 @@ class HomeTest(unittest.TestCase):
     def test_another_place_leaves_home_alone(self):
         run_main("--home", "gent")
         run_main("brugge")
-        self.assertEqual(buien.load_home().name, "Gent")
+        self.assertEqual(buien.load_places()["home"].name, "Gent")
 
     def test_home_needs_a_place(self):
         code, _, err = run_main("--home")
         self.assertEqual(code, 1)
         self.assertIn("buien --home gent", err)
+
+    def test_a_place_saved_under_its_own_name(self):
+        code, out, err = run_main("--save", "work", "brussel")
+        self.assertEqual(code, 0)
+        self.assertIn("Brussel is saved as work, from now on buien work is enough", err)
+        self.assertIn("Brussel · ", plain(out))
+        self.lookup.reset_mock()
+        code, out, _ = run_main("work")
+        self.assertEqual(code, 0)
+        self.assertIn("Brussel · ", plain(out))
+        self.lookup.assert_not_called()
+
+    def test_saved_names_ignore_case_and_may_be_several_words(self):
+        run_main("--save", "Grandma Lisa", "sint", "niklaas")
+        code, out, _ = run_main("grandma", "lisa")
+        self.assertEqual(code, 0)
+        self.assertIn("Sint Niklaas · ", plain(out))
+
+    def test_save_needs_a_name_and_a_place(self):
+        code, _, err = run_main("--save", "work")
+        self.assertEqual(code, 1)
+        self.assertIn("buien --save work brussel", err)
+        self.assertFalse(os.path.exists(self.places_file))
+
+    def test_every_place_is_kept_and_saving_again_replaces(self):
+        run_main("--home", "gent")
+        run_main("--save", "work", "brussel")
+        run_main("--save", "work", "leuven")
+        places = buien.load_places()
+        self.assertEqual(sorted(places), ["home", "work"])
+        self.assertEqual(places["work"].name, "Leuven")
+
+    def test_an_unsaved_name_is_looked_up(self):
+        run_main("--save", "work", "brussel")
+        code, out, _ = run_main("brugge")
+        self.assertEqual(code, 0)
+        self.assertIn("Brugge · ", plain(out))
 
     def test_first_run_outside_a_terminal(self):
         with mock.patch.object(buien.sys.stdin, "isatty", return_value=False):
@@ -241,12 +276,12 @@ class HomeTest(unittest.TestCase):
         self.assertEqual(code, 0)
         ask.assert_called_once()
         self.assertIn("Leuven · ", plain(out))
-        self.assertEqual(buien.load_home(), buien.Place("Leuven", 51.05, 3.72))
+        self.assertEqual(buien.load_places()["home"], buien.Place("Leuven", 51.05, 3.72))
 
-    def test_unreadable_home(self):
-        os.makedirs(os.path.dirname(self.home_file))
-        with open(self.home_file, "w") as file:
-            file.write("{kapot")
+    def test_unreadable_places(self):
+        os.makedirs(os.path.dirname(self.places_file))
+        with open(self.places_file, "w") as file:
+            file.write("{broken")
         code, _, err = run_main()
         self.assertEqual(code, 1)
         self.assertIn("unreadable", err)

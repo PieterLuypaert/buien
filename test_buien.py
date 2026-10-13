@@ -320,6 +320,28 @@ class PlacesTest(unittest.TestCase):
         self.assertIn("unreadable", err)
 
 
+BERGEN = {"results": [
+    {"name": "Bergen", "country_code": "NO", "country": "Noorwegen", "admin1": "Vestland",
+     "admin2": "Bergen", "latitude": 60.39, "longitude": 5.32},
+    {"name": "Bergen", "country_code": "BE", "country": "België", "admin1": "Waals Gewest",
+     "admin2": "Henegouwen", "latitude": 50.45, "longitude": 3.95},
+    {"name": "Bergen", "country_code": "NL", "country": "Nederland", "admin1": "Noord-Holland",
+     "admin2": "Bergen (NH.)", "latitude": 52.67, "longitude": 4.70},
+]}
+
+
+class ProvinceTest(unittest.TestCase):
+    def test_plain_lookup_takes_the_first_match_with_its_province(self):
+        with mock.patch.object(buien, "fetch_json", return_value=BERGEN):
+            self.assertEqual(buien.lookup("bergen"), buien.Place("Bergen, Henegouwen", 50.45, 3.95))
+
+    def test_no_province_when_it_is_the_place_itself(self):
+        result = {"name": "Antwerpen", "country_code": "BE", "admin1": "Vlaams Gewest",
+                  "admin2": "Antwerpen", "latitude": 51.22, "longitude": 4.40}
+        self.assertEqual(buien.to_place(result).name, "Antwerpen")
+        self.assertEqual(buien.to_place({**result, "admin2": None, "admin1": None}).name, "Antwerpen")
+
+
 class CommandTest(unittest.TestCase):
     def test_place_of_several_words(self):
         self.assertEqual(buien.parse_args(["sint", "niklaas"]).words, ["sint", "niklaas"])

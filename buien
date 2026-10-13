@@ -96,17 +96,30 @@ def lookup(text):
     if match:
         lat, lon = float(match[1]), float(match[2])
         return Place(f"{lat:.2f}, {lon:.2f}", lat, lon)
-    return geocode(text)
+    return to_place(find_places(text)[0])
 
 
-def geocode(name):
+def find_places(name):
+    """Every match for a place name, Belgian and Dutch ones first."""
     results = search_places(name)
     if not results and " " in name:
         results = search_places(name.replace(" ", "-"))
     if not results:
         raise BuienError(f"no place found called '{name}'")
-    best = next((r for r in results if r.get("country_code") in NEARBY_COUNTRIES), results[0])
-    return Place(best["name"], best["latitude"], best["longitude"])
+    return sorted(results, key=lambda result: result.get("country_code") not in NEARBY_COUNTRIES)
+
+
+def to_place(result):
+    name, region = result["name"], region_of(result)
+    label = f"{name}, {region}" if region and region != name else name
+    return Place(label, result["latitude"], result["longitude"])
+
+
+def region_of(result):
+    """The province: admin1 is only the region in Belgium, so there it is admin2."""
+    if result.get("country_code") == "BE" and result.get("admin2"):
+        return result["admin2"]
+    return result.get("admin1")
 
 
 def search_places(name):

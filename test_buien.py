@@ -3,6 +3,7 @@ import contextlib
 import importlib.machinery
 import importlib.util
 import io
+import json
 import os
 import sys
 import tempfile
@@ -266,6 +267,25 @@ class CommandTest(unittest.TestCase):
         code, out, _ = run_main("-h")
         self.assertEqual(code, 0)
         self.assertIn("buien gent", out)
+
+    def run_with_forecast(self, *argv):
+        with mock.patch.object(buien, "lookup", return_value=GENT), \
+                mock.patch.object(buien, "fetch_forecast", return_value=slots(0, 1.5, 0)):
+            return run_main("gent", *argv)
+
+    def test_kort_prints_only_the_summary(self):
+        code, out, _ = self.run_with_forecast("--kort")
+        self.assertEqual(code, 0)
+        self.assertEqual(out, "droog tot 12:35, dan 5 min lichte regen\n")
+
+    def test_json(self):
+        code, out, _ = self.run_with_forecast("--json")
+        self.assertEqual(code, 0)
+        data = json.loads(out)
+        self.assertEqual(data["place"], "Gent")
+        self.assertEqual(data["summary"], "droog tot 12:35, dan 5 min lichte regen")
+        self.assertEqual([slot["mm_per_hour"] for slot in data["forecast"]], [0, 1.5, 0])
+        self.assertEqual(data["forecast"][1]["time"], START.replace(minute=35).isoformat(timespec="minutes"))
 
     def test_shows_the_chart(self):
         with mock.patch.object(buien, "lookup", return_value=GENT), \

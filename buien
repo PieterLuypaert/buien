@@ -7,6 +7,8 @@
   buien sint niklaas  een plaatsnaam mag uit meer woorden bestaan
   buien 51.05,3.72    coördinaten
   buien --thuis gent  bewaar Gent als thuis en toon het meteen
+  buien --kort        alleen de samenvatting, voor een statusbalk of prompt
+  buien --json        de verwachting als JSON, voor scripts
 
 Thuis staat in ~/.config/buien/thuis.json.
 Werkt in Nederland, België en de grensstreek, zo ver als de radar van
@@ -58,6 +60,8 @@ class BuienError(Exception):
 class Options:
     words: list = field(default_factory=list)
     home: bool = False
+    short: bool = False
+    as_json: bool = False
     help: bool = False
 
 
@@ -323,6 +327,16 @@ def render(place, slots, now, color, width):
     return "\n".join(lines)
 
 
+def to_json(place, slots):
+    return {
+        "place": place.name,
+        "lat": place.lat,
+        "lon": place.lon,
+        "summary": summarize(slots),
+        "forecast": [{"time": slot.time.isoformat(timespec="minutes"), "mm_per_hour": slot.mm} for slot in slots],
+    }
+
+
 def use_color():
     return sys.stdout.isatty() and not os.environ.get("NO_COLOR")
 
@@ -334,6 +348,10 @@ def parse_args(argv):
             options.help = True
         elif arg in ("-t", "--thuis"):
             options.home = True
+        elif arg in ("-k", "--kort"):
+            options.short = True
+        elif arg == "--json":
+            options.as_json = True
         elif arg.startswith("-") and not COORDS.match(arg):
             raise BuienError(f"onbekende optie {arg}, zie buien -h")
         else:
@@ -348,7 +366,12 @@ def run(options):
     place = resolve_place(options)
     now = datetime.now().astimezone()
     slots = fetch_forecast(place, now)
-    print(render(place, slots, now, use_color(), shutil.get_terminal_size().columns))
+    if options.as_json:
+        print(json.dumps(to_json(place, slots), ensure_ascii=False, indent=2))
+    elif options.short:
+        print(summarize(slots))
+    else:
+        print(render(place, slots, now, use_color(), shutil.get_terminal_size().columns))
     return 0
 
 

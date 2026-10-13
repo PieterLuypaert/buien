@@ -199,7 +199,7 @@ class HomeTest(unittest.TestCase):
     def setUp(self):
         config = tempfile.TemporaryDirectory()
         self.addCleanup(config.cleanup)
-        self.home_file = os.path.join(config.name, "buien", "thuis.json")
+        self.home_file = os.path.join(config.name, "buien", "home.json")
         patches = [
             mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": config.name}),
             mock.patch.object(buien, "lookup", side_effect=lambda text: buien.Place(text.title(), 51.05, 3.72)),
@@ -209,31 +209,31 @@ class HomeTest(unittest.TestCase):
             patch.start()
             self.addCleanup(patch.stop)
 
-    def test_thuis_is_remembered(self):
-        code, _, err = run_main("--thuis", "gent")
+    def test_home_is_remembered(self):
+        code, _, err = run_main("--home", "gent")
         self.assertEqual(code, 0)
-        self.assertIn("Gent is nu thuis", err)
+        self.assertIn("Gent is now home", err)
         code, out, _ = run_main()
         self.assertEqual(code, 0)
         self.assertIn("Gent · ", plain(out))
 
-    def test_another_place_leaves_thuis_alone(self):
-        run_main("--thuis", "gent")
+    def test_another_place_leaves_home_alone(self):
+        run_main("--home", "gent")
         run_main("brugge")
         self.assertEqual(buien.load_home().name, "Gent")
 
-    def test_thuis_needs_a_place(self):
-        code, _, err = run_main("--thuis")
+    def test_home_needs_a_place(self):
+        code, _, err = run_main("--home")
         self.assertEqual(code, 1)
-        self.assertIn("buien --thuis gent", err)
+        self.assertIn("buien --home gent", err)
 
     def test_first_run_outside_a_terminal(self):
         with mock.patch.object(buien.sys.stdin, "isatty", return_value=False):
             code, _, err = run_main()
         self.assertEqual(code, 1)
-        self.assertIn("nog geen thuis bewaard", err)
+        self.assertIn("no home saved yet", err)
 
-    def test_first_run_asks_for_thuis(self):
+    def test_first_run_asks_for_home(self):
         with mock.patch.object(buien.sys.stdin, "isatty", return_value=True), \
                 mock.patch("builtins.input", return_value="leuven") as ask:
             code, out, _ = run_main()
@@ -242,13 +242,13 @@ class HomeTest(unittest.TestCase):
         self.assertIn("Leuven · ", plain(out))
         self.assertEqual(buien.load_home(), buien.Place("Leuven", 51.05, 3.72))
 
-    def test_unreadable_thuis(self):
+    def test_unreadable_home(self):
         os.makedirs(os.path.dirname(self.home_file))
         with open(self.home_file, "w") as file:
             file.write("{kapot")
         code, _, err = run_main()
         self.assertEqual(code, 1)
-        self.assertIn("onleesbaar", err)
+        self.assertIn("unreadable", err)
 
 
 class CommandTest(unittest.TestCase):
@@ -261,7 +261,7 @@ class CommandTest(unittest.TestCase):
     def test_unknown_option(self):
         code, _, err = run_main("--foo")
         self.assertEqual(code, 1)
-        self.assertIn("buien: onbekende optie --foo", err)
+        self.assertIn("buien: unknown option --foo", err)
 
     def test_help(self):
         code, out, _ = run_main("-h")
@@ -273,8 +273,8 @@ class CommandTest(unittest.TestCase):
                 mock.patch.object(buien, "fetch_forecast", return_value=slots(0, 1.5, 0)):
             return run_main("gent", *argv)
 
-    def test_kort_prints_only_the_summary(self):
-        code, out, _ = self.run_with_forecast("--kort")
+    def test_short_prints_only_the_summary(self):
+        code, out, _ = self.run_with_forecast("--short")
         self.assertEqual(code, 0)
         self.assertEqual(out, "droog tot 12:35, dan 5 min lichte regen\n")
 

@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-"""buien: de regen voor de komende uren in je terminal, van Buienradar.
+"""buien: the rain for the next few hours in your terminal, from Buienradar.
 
-  buien               de regen thuis voor de komende drie uur
-                      (de eerste keer vraagt buien waar thuis is)
-  buien gent          ergens anders
-  buien sint niklaas  een plaatsnaam mag uit meer woorden bestaan
-  buien 51.05,3.72    coördinaten
-  buien --thuis gent  bewaar Gent als thuis en toon het meteen
-  buien --kort        alleen de samenvatting, voor een statusbalk of prompt
-  buien --json        de verwachting als JSON, voor scripts
+  buien               the rain at home for the next three hours
+                      (the first time, buien asks where home is)
+  buien gent          somewhere else
+  buien sint niklaas  a place name may be several words
+  buien 51.05,3.72    coordinates
+  buien --home gent   save Gent as home and show it right away
+  buien --short       only the summary, for a status bar or prompt
+  buien --json        the forecast as JSON, for scripts
 
-Thuis staat in ~/.config/buien/thuis.json.
-Werkt in Nederland, België en de grensstreek, zo ver als de radar van
-Buienradar reikt. De kleur valt weg met NO_COLOR of als de uitvoer geen
-terminal is.
+Home is kept in ~/.config/buien/home.json.
+Works in the Netherlands, Belgium and the border regions, as far as
+Buienradar's radar reaches. Colour is dropped with NO_COLOR or when the
+output is not a terminal.
 """
 import json
 import math
@@ -107,7 +107,7 @@ def search_places(name):
 
 def home_file():
     config = os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config"
-    return Path(config) / "buien" / "thuis.json"
+    return Path(config) / "buien" / "home.json"
 
 
 def load_home():
@@ -118,25 +118,25 @@ def load_home():
         data = json.loads(path.read_text())
         return Place(data["name"], float(data["lat"]), float(data["lon"]))
     except (OSError, ValueError, KeyError, TypeError) as error:
-        raise BuienError(f"{path} is onleesbaar ({error!r}), zet thuis opnieuw met buien --thuis <plaats>") from error
+        raise BuienError(f"{path} is unreadable ({error!r}), set home again with buien --home <place>") from error
 
 
 def save_home(place):
     path = home_file()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(place._asdict(), ensure_ascii=False) + "\n")
-    print(f"{place.name} is nu thuis, voortaan volstaat buien", file=sys.stderr)
+    print(f"{place.name} is now home, from now on plain buien is enough", file=sys.stderr)
 
 
 def ask_home():
     if not sys.stdin.isatty():
-        raise BuienError("nog geen thuis bewaard, doe eerst buien --thuis <plaats>")
+        raise BuienError("no home saved yet, run buien --home <place> first")
     try:
-        name = input("Voor welke plaats wil je standaard de buien zien? (bv. Gent) ").strip()
+        name = input("Which place do you want the rain for by default? (e.g. Gent) ").strip()
     except EOFError:
         name = ""
     if not name:
-        raise BuienError("geen plaats opgegeven")
+        raise BuienError("no place given")
     place = lookup(name)
     save_home(place)
     return place
@@ -149,7 +149,7 @@ def resolve_place(options):
             save_home(place)
         return place
     if options.home:
-        raise BuienError("zeg welke plaats thuis is, bv. buien --thuis gent")
+        raise BuienError("say which place is home, e.g. buien --home gent")
     return load_home() or ask_home()
 
 
@@ -346,14 +346,14 @@ def parse_args(argv):
     for arg in argv:
         if arg in ("-h", "--help"):
             options.help = True
-        elif arg in ("-t", "--thuis"):
+        elif arg == "--home":
             options.home = True
-        elif arg in ("-k", "--kort"):
+        elif arg in ("-s", "--short"):
             options.short = True
         elif arg == "--json":
             options.as_json = True
         elif arg.startswith("-") and not COORDS.match(arg):
-            raise BuienError(f"onbekende optie {arg}, zie buien -h")
+            raise BuienError(f"unknown option {arg}, see buien -h")
         else:
             options.words.append(arg)
     return options

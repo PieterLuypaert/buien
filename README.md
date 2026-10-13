@@ -1,6 +1,6 @@
 # buien
 
-Moet ik nu fietsen? `buien` toont de regen voor de komende drie uur als een grafiekje in je terminal, met een samenvatting zoals "droog tot 14:20, dan 15 min lichte regen". De data komt van Buienradar, dus het werkt in Nederland, België en de grensstreek.
+Should I cycle now? `buien` shows the rain for the next three hours as a small chart in your terminal, with a summary such as "dry until 14:20, then 15 min of light rain". The data comes from Buienradar, so it works in the Netherlands, Belgium and the border regions.
 
 ```sh
 mkdir -p ~/.local/bin
@@ -8,4 +8,4 @@ curl -fsSL https://raw.githubusercontent.com/PieterLuypaert/buien/main/buien -o 
 chmod +x ~/.local/bin/buien
 ```
 
-Heeft enkel `python3` nodig. Typ `buien`, of `buien -h` voor alle opties.
+Needs only `python3`. Run `buien`, or `buien -h` for every option.

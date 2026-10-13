@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """buien: de regen voor de komende uren in je terminal, van Buienradar.
 
-  buien gent          de regen in Gent voor de komende drie uur
+  buien               de regen thuis voor de komende drie uur
+                      (de eerste keer vraagt buien waar thuis is)
+  buien gent          ergens anders
   buien sint niklaas  een plaatsnaam mag uit meer woorden bestaan
   buien 51.05,3.72    coördinaten
+  buien --thuis gent  bewaar Gent als thuis en toon het meteen
 
+Thuis staat in ~/.config/buien/thuis.json.
 Werkt in Nederland, België en de grensstreek, zo ver als de radar van
 Buienradar reikt. De kleur valt weg met NO_COLOR of als de uitvoer geen
 terminal is.
@@ -21,6 +25,7 @@ import urllib.request
 from collections import namedtuple
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 FORECAST_URL = "https://graphdata.buienradar.nl/2.0/forecast/geo/Rain3Hour?lat={lat:.2f}&lon={lon:.2f}"
 GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search?"
@@ -52,6 +57,7 @@ class BuienError(Exception):
 @dataclass
 class Options:
     words: list = field(default_factory=list)
+    home: bool = False
     help: bool = False
 
 
@@ -93,6 +99,54 @@ def geocode(name):
 def search_places(name):
     query = urllib.parse.urlencode({"name": name, "count": 10, "language": "nl", "format": "json"})
     return (fetch_json(GEOCODE_URL + query) or {}).get("results") or []
+
+
+def home_file():
+    config = os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config"
+    return Path(config) / "buien" / "thuis.json"
+
+
+def load_home():
+    path = home_file()
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text())
+        return Place(data["name"], float(data["lat"]), float(data["lon"]))
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise BuienError(f"{path} is onleesbaar ({error!r}), zet thuis opnieuw met buien --thuis <plaats>") from error
+
+
+def save_home(place):
+    path = home_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(place._asdict(), ensure_ascii=False) + "\n")
+    print(f"{place.name} is nu thuis, voortaan volstaat buien", file=sys.stderr)
+
+
+def ask_home():
+    if not sys.stdin.isatty():
+        raise BuienError("nog geen thuis bewaard, doe eerst buien --thuis <plaats>")
+    try:
+        name = input("Voor welke plaats wil je standaard de buien zien? (bv. Gent) ").strip()
+    except EOFError:
+        name = ""
+    if not name:
+        raise BuienError("geen plaats opgegeven")
+    place = lookup(name)
+    save_home(place)
+    return place
+
+
+def resolve_place(options):
+    if options.words:
+        place = lookup(" ".join(options.words))
+        if options.home:
+            save_home(place)
+        return place
+    if options.home:
+        raise BuienError("zeg welke plaats thuis is, bv. buien --thuis gent")
+    return load_home() or ask_home()
 
 
 def fetch_forecast(place, now):
@@ -278,6 +332,8 @@ def parse_args(argv):
     for arg in argv:
         if arg in ("-h", "--help"):
             options.help = True
+        elif arg in ("-t", "--thuis"):
+            options.home = True
         elif arg.startswith("-") and not COORDS.match(arg):
             raise BuienError(f"onbekende optie {arg}, zie buien -h")
         else:
@@ -286,10 +342,10 @@ def parse_args(argv):
 
 
 def run(options):
-    if options.help or not options.words:
+    if options.help:
         print(__doc__.strip())
         return 0
-    place = lookup(" ".join(options.words))
+    place = resolve_place(options)
     now = datetime.now().astimezone()
     slots = fetch_forecast(place, now)
     print(render(place, slots, now, use_color(), shutil.get_terminal_size().columns))

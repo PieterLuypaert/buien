@@ -5,6 +5,7 @@ import importlib.util
 import io
 import os
 import sys
+import tempfile
 import unittest
 import urllib.error
 from datetime import datetime, timezone
@@ -186,13 +187,70 @@ class LookupTest(unittest.TestCase):
                 buien.lookup("xyzzy")
 
 
-class CommandTest(unittest.TestCase):
-    def run_main(self, *argv):
-        out, err = io.StringIO(), io.StringIO()
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            code = buien.main(list(argv))
-        return code, out.getvalue(), err.getvalue()
+def run_main(*argv):
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        code = buien.main(list(argv))
+    return code, out.getvalue(), err.getvalue()
 
+
+class HomeTest(unittest.TestCase):
+    def setUp(self):
+        config = tempfile.TemporaryDirectory()
+        self.addCleanup(config.cleanup)
+        self.home_file = os.path.join(config.name, "buien", "thuis.json")
+        patches = [
+            mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": config.name}),
+            mock.patch.object(buien, "lookup", side_effect=lambda text: buien.Place(text.title(), 51.05, 3.72)),
+            mock.patch.object(buien, "fetch_forecast", return_value=slots(0, 0)),
+        ]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def test_thuis_is_remembered(self):
+        code, _, err = run_main("--thuis", "gent")
+        self.assertEqual(code, 0)
+        self.assertIn("Gent is nu thuis", err)
+        code, out, _ = run_main()
+        self.assertEqual(code, 0)
+        self.assertIn("Gent · ", plain(out))
+
+    def test_another_place_leaves_thuis_alone(self):
+        run_main("--thuis", "gent")
+        run_main("brugge")
+        self.assertEqual(buien.load_home().name, "Gent")
+
+    def test_thuis_needs_a_place(self):
+        code, _, err = run_main("--thuis")
+        self.assertEqual(code, 1)
+        self.assertIn("buien --thuis gent", err)
+
+    def test_first_run_outside_a_terminal(self):
+        with mock.patch.object(buien.sys.stdin, "isatty", return_value=False):
+            code, _, err = run_main()
+        self.assertEqual(code, 1)
+        self.assertIn("nog geen thuis bewaard", err)
+
+    def test_first_run_asks_for_thuis(self):
+        with mock.patch.object(buien.sys.stdin, "isatty", return_value=True), \
+                mock.patch("builtins.input", return_value="leuven") as ask:
+            code, out, _ = run_main()
+        self.assertEqual(code, 0)
+        ask.assert_called_once()
+        self.assertIn("Leuven · ", plain(out))
+        self.assertEqual(buien.load_home(), buien.Place("Leuven", 51.05, 3.72))
+
+    def test_unreadable_thuis(self):
+        os.makedirs(os.path.dirname(self.home_file))
+        with open(self.home_file, "w") as file:
+            file.write("{kapot")
+        code, _, err = run_main()
+        self.assertEqual(code, 1)
+        self.assertIn("onleesbaar", err)
+
+
+class CommandTest(unittest.TestCase):
     def test_place_of_several_words(self):
         self.assertEqual(buien.parse_args(["sint", "niklaas"]).words, ["sint", "niklaas"])
 
@@ -200,19 +258,19 @@ class CommandTest(unittest.TestCase):
         self.assertEqual(buien.parse_args(["-3.7,40.4"]).words, ["-3.7,40.4"])
 
     def test_unknown_option(self):
-        code, _, err = self.run_main("--foo")
+        code, _, err = run_main("--foo")
         self.assertEqual(code, 1)
         self.assertIn("buien: onbekende optie --foo", err)
 
     def test_help(self):
-        code, out, _ = self.run_main("-h")
+        code, out, _ = run_main("-h")
         self.assertEqual(code, 0)
         self.assertIn("buien gent", out)
 
     def test_shows_the_chart(self):
         with mock.patch.object(buien, "lookup", return_value=GENT), \
                 mock.patch.object(buien, "fetch_forecast", return_value=slots(0, 1, 0)):
-            code, out, _ = self.run_main("gent")
+            code, out, _ = run_main("gent")
         self.assertEqual(code, 0)
         self.assertIn("droog tot 12:35, dan 5 min lichte regen", out)
 

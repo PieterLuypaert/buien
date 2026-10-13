@@ -44,11 +44,11 @@ Slot = namedtuple("Slot", "time mm")
 Kind = namedtuple("Kind", "limit name label adjective color")
 
 KINDS = [
-    Kind(0.5, "wat druppels", "druppels", "lichte", 110),
-    Kind(2, "lichte regen", "licht", "lichte", 74),
-    Kind(5, "matige regen", "matig", "matige", 32),
-    Kind(10, "stevige regen", "stevig", "stevige", 26),
-    Kind(math.inf, "hevige regen", "hevig", "hevige", 162),
+    Kind(0.5, "drizzle", "drizzle", "light", 110),
+    Kind(2, "light rain", "light", "light", 74),
+    Kind(5, "moderate rain", "moderate", "moderate", 32),
+    Kind(10, "heavy rain", "heavy", "heavy", 26),
+    Kind(math.inf, "very heavy rain", "very heavy", "very heavy", 162),
 ]
 
 
@@ -75,11 +75,11 @@ def fetch_json(url):
     except urllib.error.HTTPError as error:
         if error.code == 404:
             return None
-        raise BuienError(f"{host} antwoordt met HTTP {error.code}") from error
+        raise BuienError(f"{host} answered with HTTP {error.code}") from error
     except urllib.error.URLError as error:
-        raise BuienError(f"{host} is niet bereikbaar ({error.reason})") from error
+        raise BuienError(f"{host} is unreachable ({error.reason})") from error
     except (OSError, ValueError) as error:
-        raise BuienError(f"geen bruikbaar antwoord van {host} ({error})") from error
+        raise BuienError(f"no usable answer from {host} ({error})") from error
 
 
 def lookup(text):
@@ -95,7 +95,7 @@ def geocode(name):
     if not results and " " in name:
         results = search_places(name.replace(" ", "-"))
     if not results:
-        raise BuienError(f"geen plaats gevonden die '{name}' heet")
+        raise BuienError(f"no place found called '{name}'")
     best = next((r for r in results if r.get("country_code") in NEARBY_COUNTRIES), results[0])
     return Place(best["name"], best["latitude"], best["longitude"])
 
@@ -156,7 +156,7 @@ def resolve_place(options):
 def fetch_forecast(place, now):
     data = fetch_json(FORECAST_URL.format(lat=place.lat, lon=place.lon))
     if data is None:
-        raise BuienError(f"Buienradar heeft geen radar voor {place.name}, alleen voor Nederland, België en de grensstreek")
+        raise BuienError(f"Buienradar has no radar for {place.name}, only for the Netherlands, Belgium and the border regions")
     return parse_forecast(data, now)
 
 
@@ -165,10 +165,10 @@ def parse_forecast(data, now):
     try:
         slots = [Slot(utc_to_local(f["utcdatetime"]), float(f["precipitation"])) for f in data["forecasts"]]
     except (KeyError, TypeError, ValueError) as error:
-        raise BuienError(f"Buienradar stuurde een onverwacht antwoord ({error!r})") from error
+        raise BuienError(f"Buienradar sent an unexpected answer ({error!r})") from error
     upcoming = [slot for slot in slots if slot.time + STEP > now]
     if not upcoming:
-        raise BuienError("de verwachting van Buienradar is verouderd, probeer het zo opnieuw")
+        raise BuienError("Buienradar's forecast is out of date, try again in a moment")
     return upcoming
 
 
@@ -181,12 +181,12 @@ def kind_of(mm):
 
 
 def spell_kind(slots):
-    """'lichte regen', or a range such as 'lichte tot hevige regen'."""
+    """'light rain', or a range such as 'light to heavy rain'."""
     rainy = [slot.mm for slot in slots if slot.mm > 0]
     lightest, heaviest = kind_of(min(rainy)), kind_of(max(rainy))
     if lightest.adjective == heaviest.adjective:
         return heaviest.name
-    return f"{lightest.adjective} tot {heaviest.adjective} regen"
+    return f"{lightest.adjective} to {heaviest.adjective} rain"
 
 
 def rain_spells(slots):
@@ -206,11 +206,11 @@ def summarize(slots):
     spells = rain_spells(slots)
     horizon = clock(slots[-1].time + STEP)
     if not spells:
-        return f"droog tot minstens {horizon}"
+        return f"dry until at least {horizon}"
     text = describe_spell(slots, spells[0], horizon)
     if len(spells) > 1:
         start, end = spells[1]
-        text += f", rond {clock(slots[start].time)} nog eens {spell_kind(slots[start:end])}"
+        text += f", more {spell_kind(slots[start:end])} around {clock(slots[start].time)}"
     return text
 
 
@@ -219,22 +219,21 @@ def describe_spell(slots, spell, horizon):
     kind = spell_kind(slots[start:end])
     lasts_past_horizon = end == len(slots)
     if start == 0 and lasts_past_horizon:
-        return f"nu {kind}, niet droog voor {horizon}"
+        return f"{kind} now, not dry before {horizon}"
     if start == 0:
-        return f"nu {kind}, droog vanaf {clock(slots[end].time)}"
+        return f"{kind} now, dry from {clock(slots[end].time)}"
     dry_until = clock(slots[start].time)
     if lasts_past_horizon:
-        return f"droog tot {dry_until}, daarna {kind}"
-    return f"droog tot {dry_until}, dan {duration((end - start) * 5)} {kind}"
+        return f"dry until {dry_until}, then {kind}"
+    return f"dry until {dry_until}, then {duration((end - start) * 5)} of {kind}"
 
 
 def peak(slots):
-    """'het hardst om 13:25: 2,4 mm per uur', or None when it stays dry."""
+    """'heaviest at 13:25: 2.4 mm per hour', or None when it stays dry."""
     top = max(slots, key=lambda slot: slot.mm)
     if top.mm <= 0:
         return None
-    amount = f"{top.mm:.1f}".replace(".", ",")
-    return f"het hardst om {clock(top.time)}: {amount} mm per uur"
+    return f"heaviest at {clock(top.time)}: {top.mm:.1f} mm per hour"
 
 
 def clock(moment):
@@ -245,7 +244,9 @@ def duration(minutes):
     if minutes < 60:
         return f"{minutes} min"
     hours, rest = divmod(minutes, 60)
-    return f"{hours} uur" if not rest else f"{hours}u{rest:02d}"
+    if rest:
+        return f"{hours}h{rest:02d}"
+    return f"{hours} hour" if hours == 1 else f"{hours} hours"
 
 
 class Paint:
@@ -295,7 +296,7 @@ def axis(slots, cell):
 
 def time_labels(slots, cell):
     every = 30 if cell == 2 else 60
-    line = "nu"
+    line = "now"
     for index, slot in enumerate(slots):
         column = index * cell
         if index == 0 or slot.time.minute % every or column <= len(line):

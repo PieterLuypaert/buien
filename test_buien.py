@@ -202,7 +202,7 @@ class PlacesTest(unittest.TestCase):
         self.addCleanup(config.cleanup)
         self.places_file = os.path.join(config.name, "buien", "places.json")
         self.lookup = mock.patch.object(
-            buien, "lookup", side_effect=lambda text: buien.Place(text.title(), 51.05, 3.72)
+            buien, "lookup", side_effect=lambda text, choose=False: buien.Place(text.title(), 51.05, 3.72)
         ).start()
         mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": config.name}).start()
         mock.patch.object(buien, "fetch_forecast", return_value=slots(0, 0)).start()
@@ -330,10 +330,71 @@ BERGEN = {"results": [
 ]}
 
 
-class ProvinceTest(unittest.TestCase):
+class SearchTest(unittest.TestCase):
+    def setUp(self):
+        config = tempfile.TemporaryDirectory()
+        self.addCleanup(config.cleanup)
+        mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": config.name}).start()
+        self.fetch_json = mock.patch.object(buien, "fetch_json", return_value=BERGEN).start()
+        self.fetch_forecast = mock.patch.object(buien, "fetch_forecast", return_value=slots(0, 0)).start()
+        self.addCleanup(mock.patch.stopall)
+
+    def search(self, *argv, answer=None):
+        is_terminal = answer is not None
+        with mock.patch.object(buien.sys.stdin, "isatty", return_value=is_terminal), \
+                mock.patch("builtins.input", return_value=answer or ""):
+            return run_main("--search", *argv)
+
+    def test_lists_every_match_belgian_and_dutch_first(self):
+        code, out, _ = self.search("bergen")
+        self.assertEqual(code, 0)
+        self.assertEqual(out.splitlines(), [
+            "  1  Bergen, Henegouwen     België",
+            "  2  Bergen, Noord-Holland  Nederland",
+            "  3  Bergen, Vestland       Noorwegen",
+        ])
+        self.fetch_forecast.assert_not_called()
+
+    def test_shows_the_one_you_pick(self):
+        code, out, _ = self.search("bergen", answer="2")
+        self.assertEqual(code, 0)
+        self.assertIn("Bergen, Noord-Holland · ", plain(out))
+        self.assertEqual(self.fetch_forecast.call_args[0][0], buien.Place("Bergen, Noord-Holland", 52.67, 4.70))
+
+    def test_enter_stops_without_a_forecast(self):
+        code, _, _ = self.search("bergen", answer="")
+        self.assertEqual(code, 0)
+        self.fetch_forecast.assert_not_called()
+
+    def test_a_number_out_of_range(self):
+        code, _, err = self.search("bergen", answer="7")
+        self.assertEqual(code, 1)
+        self.assertIn("pick a number from 1 to 3", err)
+
+    def test_saves_the_one_you_pick(self):
+        code, _, err = self.search("--save", "beach", "bergen", answer="2")
+        self.assertEqual(code, 0)
+        self.assertIn("Bergen, Noord-Holland is saved as beach", err)
+        self.assertEqual(buien.load_places()["beach"].lat, 52.67)
+
+    def test_saves_nothing_without_a_pick(self):
+        code, _, _ = self.search("--home", "bergen", answer="")
+        self.assertEqual(code, 0)
+        self.assertEqual(buien.load_places(), {})
+
+    def test_searches_past_a_saved_name(self):
+        buien.write_places({"bergen": buien.Place("Gent", 51.05, 3.72)})
+        code, out, _ = self.search("bergen")
+        self.assertEqual(code, 0)
+        self.assertIn("Bergen, Henegouwen", out)
+
+    def test_search_needs_a_name(self):
+        code, _, err = self.search()
+        self.assertEqual(code, 1)
+        self.assertIn("buien --search bergen", err)
+
     def test_plain_lookup_takes_the_first_match_with_its_province(self):
-        with mock.patch.object(buien, "fetch_json", return_value=BERGEN):
-            self.assertEqual(buien.lookup("bergen"), buien.Place("Bergen, Henegouwen", 50.45, 3.95))
+        self.assertEqual(buien.lookup("bergen"), buien.Place("Bergen, Henegouwen", 50.45, 3.95))
 
     def test_no_province_when_it_is_the_place_itself(self):
         result = {"name": "Antwerpen", "country_code": "BE", "admin1": "Vlaams Gewest",

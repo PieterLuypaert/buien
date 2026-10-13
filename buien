@@ -10,6 +10,9 @@
   buien --home gent   save Gent as home and show it right away
   buien --save work brussel
                       save Brussel as work, from then on: buien work
+  buien --search bergen
+                      list every Bergen and pick one, also with --home or
+                      --save to save the one you pick
   buien --places      list your saved places
   buien --forget work forget a saved place
   buien --short       only the summary, for a status bar or prompt
@@ -67,6 +70,7 @@ class Options:
     words: list = field(default_factory=list)
     home: bool = False
     save: bool = False
+    search: bool = False
     forget: bool = False
     list_places: bool = False
     short: bool = False
@@ -91,11 +95,14 @@ def fetch_json(url):
         raise BuienError(f"no usable answer from {host} ({error})") from error
 
 
-def lookup(text):
+def lookup(text, choose=False):
+    """The place for a name or coordinates; with choose, the one picked from every match."""
     match = COORDS.match(text)
     if match:
         lat, lon = float(match[1]), float(match[2])
         return Place(f"{lat:.2f}, {lon:.2f}", lat, lon)
+    if choose:
+        return choose_place(find_places(text))
     return to_place(find_places(text)[0])
 
 
@@ -120,6 +127,25 @@ def region_of(result):
     if result.get("country_code") == "BE" and result.get("admin2"):
         return result["admin2"]
     return result.get("admin1")
+
+
+def choose_place(results):
+    """Lists the matches; in a terminal, the one picked, else None."""
+    places = [to_place(result) for result in results]
+    width = max(len(place.name) for place in places)
+    for number, (place, result) in enumerate(zip(places, results), 1):
+        print(f"{number:>3}  {place.name.ljust(width)}  {result.get('country', '')}".rstrip())
+    if not sys.stdin.isatty():
+        return None
+    try:
+        answer = input(f"Which one? (1-{len(places)}, enter to stop) ").strip()
+    except EOFError:
+        answer = ""
+    if not answer:
+        return None
+    if not answer.isdigit() or not 1 <= int(answer) <= len(places):
+        raise BuienError(f"pick a number from 1 to {len(places)}")
+    return places[int(answer) - 1]
 
 
 def search_places(name):
@@ -195,18 +221,30 @@ def ask_home():
 
 
 def resolve_place(options):
+    """The place to show, saved first with --home or --save; None when a search ends without a pick."""
+    if options.save or options.home:
+        name, words = save_target(options)
+        place = lookup(" ".join(words), choose=options.search)
+        return place and save_place(name, place)
     text = " ".join(options.words)
-    if options.save:
-        if len(options.words) < 2:
-            raise BuienError("say a name and a place, e.g. buien --save work brussel")
-        return save_place(options.words[0], lookup(" ".join(options.words[1:])))
-    if options.home:
+    if options.search:
         if not text:
-            raise BuienError("say which place is home, e.g. buien --home gent")
-        return save_place(HOME, lookup(text))
+            raise BuienError("say what to search for, e.g. buien --search bergen")
+        return lookup(text, choose=True)
     if text:
         return load_places().get(text.lower()) or lookup(text)
     return load_places().get(HOME) or ask_home()
+
+
+def save_target(options):
+    """The name to save under and the words of the place, for --home and --save."""
+    if options.save:
+        if len(options.words) < 2:
+            raise BuienError("say a name and a place, e.g. buien --save work brussel")
+        return options.words[0], options.words[1:]
+    if not options.words:
+        raise BuienError("say which place is home, e.g. buien --home gent")
+    return HOME, options.words
 
 
 def fetch_forecast(place, now):
@@ -407,6 +445,8 @@ def parse_args(argv):
             options.home = True
         elif arg == "--save":
             options.save = True
+        elif arg == "--search":
+            options.search = True
         elif arg == "--forget":
             options.forget = True
         elif arg == "--places":
@@ -435,6 +475,8 @@ def run(options):
         forget_place(" ".join(options.words))
         return 0
     place = resolve_place(options)
+    if place is None:
+        return 0
     now = datetime.now().astimezone()
     slots = fetch_forecast(place, now)
     if options.as_json:

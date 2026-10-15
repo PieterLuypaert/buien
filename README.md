@@ -31,6 +31,21 @@ Run `buien`, or `buien -h` for every option.
 buien --trip 20 --short >/dev/null && echo "go now" || echo "wait a bit"
 ```
 
+## Live view
+
+`buien --live` fills the terminal with the chart and keeps it up to date, with a tab for every saved place:
+
+| Key | Does |
+| --- | --- |
+| ← → | move through the hours; the line under the chart gives the rain at that moment |
+| ↑ ↓ or tab | the previous or next place |
+| / | search a place, which opens in a tab of its own |
+| s | save the place on screen under a name |
+| r | fetch the forecast again, past the cache |
+| q or esc | quit |
+
+With `--trip 25` it also says when to leave, for whichever place is on screen.
+
 ## Tab completion
 
 buien completes its options and your saved places. Add the line for your shell to its startup file:

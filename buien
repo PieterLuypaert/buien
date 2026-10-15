@@ -1001,8 +1001,10 @@ def render_map(frame, now, marks, paint, view=None):
     zoom = f" · {view.zoom}x" if view.zoom > 1 else ""
     title = f"{paint.bold('Radar')} {paint.dim(f'· {clock(frame.time)} · {when}{zoom}')}"
     key = kinds_legend(kinds_on(window), paint) or paint.dim("no rain in view" if view.zoom > 1 else "no rain on the radar")
-    gap = max(2, view.width - visible_len(title) - visible_len(key))
-    lines = ["", f"  {title}{' ' * gap}{key}".rstrip(), ""]
+    if visible_len(title) + 2 + visible_len(key) <= view.width:
+        lines = ["", f"  {title}{' ' * (view.width - visible_len(title) - visible_len(key))}{key}", ""]
+    else:
+        lines = ["", f"  {title}", f"  {key}"]
     return lines + [f"  {line}" for line in map_lines(window, mask, marks, paint, view)]
 
 

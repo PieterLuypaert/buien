@@ -1274,13 +1274,21 @@ class RadarTest(unittest.TestCase):
         line = buien.map_lines(frame, mask, marks, buien.Paint(False))[3]
         self.assertEqual(line, "    ●   ● home")
 
+    def test_a_legend_too_wide_for_the_map_gets_a_line_of_its_own(self):
+        rain = {(x, 1): color for x, color in enumerate([PALE_BLUE, (120, 128, 255, 204), DEEP_BLUE, RED])}
+        frame = buien.Frame(self.NOW, radar_rows(30, 6, rain))
+        lines = [plain(line) for line in buien.render_map(frame, self.NOW, [], buien.Paint(False))]
+        self.assertTrue(lines[1].strip().startswith("Radar ·"))
+        self.assertTrue(lines[2].strip().startswith("drizzle █"))
+        self.assertEqual(len(lines), 3 + 3)
+
     def test_the_title_says_when_and_what_falls(self):
         frame = buien.Frame(self.NOW + timedelta(minutes=20), radar_rows(8, 6, {(1, 1): PALE_BLUE}))
-        title = plain(buien.render_map(frame, self.NOW, [], buien.Paint(False))[1])
+        title = " ".join(plain(line) for line in buien.render_map(frame, self.NOW, [], buien.Paint(False))[1:3])
         self.assertIn("Radar · " + buien.clock(frame.time) + " · in 20 min", title)
         self.assertIn("drizzle █", title)
         dry = buien.Frame(self.NOW - timedelta(minutes=10), radar_rows(8, 6))
-        title = plain(buien.render_map(dry, self.NOW, [], buien.Paint(False))[1])
+        title = " ".join(plain(line) for line in buien.render_map(dry, self.NOW, [], buien.Paint(False))[1:3])
         self.assertIn("10 min ago", title)
         self.assertIn("no rain on the radar", title)
 

@@ -32,3 +32,11 @@ eval "$(buien --completions zsh)"     # ~/.zshrc, after compinit
 eval "$(buien --completions bash)"    # ~/.bashrc
 buien --completions fish > ~/.config/fish/completions/buien.fish
 ```
+
+## In a status bar or a script
+
+`buien --short` prints only the summary and `buien --json` the whole forecast. A forecast is reused for five minutes, so a status bar may run buien as often as it likes. In tmux, for example:
+
+```tmux
+set -g status-right '#(buien --short)'
+```

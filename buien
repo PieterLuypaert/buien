@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """buien: the rain for the next few hours in your terminal, from Buienradar.
 
-  buien               the rain at home for the next three hours
-                      (the first time, buien asks where home is)
+  buien               the rain at home, live: the radar map plays the next two
+                      hours above the chart of the next three; the first
+                      time, buien asks where home is
   buien gent          somewhere else
   buien sint niklaas  a place name may be several words
   buien 51.05,3.72    coordinates
@@ -17,8 +18,8 @@
   buien --forget work forget a saved place
   buien --trip 25     when to leave to stay dry on a 25-minute trip; with
                       --short it exits with 2 when you cannot leave right now
-  buien --live        full screen and kept up to date: the arrows move through
-                      the hours and your saved places, / searches, s saves
+  buien --once        the map and the chart once, then back to the prompt
+  buien --live        the live screen, which plain buien opens in a terminal
   buien --short       only the summary, for a status bar or prompt
   buien --json        the forecast as JSON, for scripts
   buien --color       colour even when the output is not a terminal, such as
@@ -27,6 +28,12 @@
                       tab completion for zsh, bash or fish, see the README
   buien --version     the version of buien
 
+In the live screen the left and right arrows or the scroll wheel move
+through the hours and pause the map there, space plays it again, up and
+down go through your saved places, / searches a place, s saves it, r
+fetches again and q quits.
+Piped into another command, buien prints the chart as text.
+
 Saved places, home among them, are kept in ~/.config/buien/places.json.
 A forecast is reused for five minutes from ~/.cache/buien, and shown from
 there when Buienradar cannot be reached.
@@ -34,8 +41,11 @@ Works in the Netherlands, Belgium and the border regions, as far as
 Buienradar's radar reaches. Colour is dropped with NO_COLOR or when the
 output is not a terminal, and kept with FORCE_COLOR.
 """
+import base64
 import contextlib
+import functools
 import http.client
+import itertools
 import json
 import math
 import os
@@ -43,11 +53,13 @@ import re
 import select
 import shutil
 import signal
+import struct
 import sys
 import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 from collections import namedtuple
 from dataclasses import dataclass, field
 from typing import Optional
@@ -71,6 +83,7 @@ CACHE_FRESH = timedelta(minutes=5)
 CACHE_KEEP = timedelta(hours=3)
 SHORT_GAP = 1
 ROWS = 3
+MAX_CELL = 4
 TRIP_COLOR = 71
 BLOCKS = " ▁▂▃▄▅▆▇█"
 COORDS = re.compile(r"^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$")
@@ -102,7 +115,8 @@ FLAGS = [
     Flag("", "--places", "list your saved places"),
     Flag("", "--forget", "forget a saved place"),
     Flag("", "--trip", "when to leave to stay dry for so many minutes", "minutes"),
-    Flag("", "--live", "full screen and kept up to date"),
+    Flag("", "--once", "the map and the chart once"),
+    Flag("", "--live", "the live screen with the map and the chart"),
     Flag("-s", "--short", "only the summary"),
     Flag("", "--json", "the forecast as JSON"),
     Flag("", "--color", "colour even when the output is not a terminal"),
@@ -127,6 +141,7 @@ class Options:
     as_json: bool = False
     trip: Optional[int] = None
     live: bool = False
+    once: bool = False
     color: Optional[bool] = None
     completions: Optional[str] = None
     help: bool = False
@@ -135,11 +150,22 @@ class Options:
 
 def fetch_json(url):
     """The decoded JSON at url, or None when the server answers 404."""
+    data = fetch_bytes(url)
+    if data is None:
+        return None
+    try:
+        return json.loads(data)
+    except ValueError as error:
+        raise BuienError(f"no usable answer from {urllib.parse.urlsplit(url).hostname} ({error!r})") from error
+
+
+def fetch_bytes(url):
+    """What the server sends for url, or None when it answers 404."""
     host = urllib.parse.urlsplit(url).hostname
     request = urllib.request.Request(url, headers={"User-Agent": f"buien/{__version__} (+{REPO_URL})"})
     try:
         with urllib.request.urlopen(request, timeout=10) as response:
-            return json.load(response)
+            return response.read()
     except urllib.error.HTTPError as error:
         if error.code == 404:
             return None
@@ -148,6 +174,120 @@ def fetch_json(url):
         raise BuienError(f"{host} is unreachable ({error.reason})") from error
     except (OSError, ValueError, http.client.HTTPException) as error:
         raise BuienError(f"no usable answer from {host} ({error!r})") from error
+
+
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+Picture = namedtuple("Picture", "width height rows channels")
+
+
+def decode_png(data):
+    """The rows of bytes of an 8-bit RGB or RGBA PNG without interlacing, the kind Buienradar sends."""
+    if not data.startswith(PNG_SIGNATURE):
+        raise BuienError("Buienradar sent a radar image that is not a PNG")
+    header, compressed, position = None, bytearray(), len(PNG_SIGNATURE)
+    while position + 8 <= len(data):
+        length, kind = struct.unpack(">I4s", data[position:position + 8])
+        body = data[position + 8:position + 8 + length]
+        if kind == b"IHDR" and len(body) == 13:
+            header = struct.unpack(">IIBBBBB", body)
+        elif kind == b"IDAT":
+            compressed += body
+        position += 12 + length
+    if header is None or header[2] != 8 or header[3] not in (2, 6) or header[6]:
+        raise BuienError("Buienradar sent a radar image buien cannot read")
+    width, height, channels = header[0], header[1], 4 if header[3] == 6 else 3
+    try:
+        raw = zlib.decompress(bytes(compressed))
+    except zlib.error as error:
+        raise BuienError(f"Buienradar sent a broken radar image ({error})") from error
+    return Picture(width, height, unfilter(raw, width * channels, height, channels), channels)
+
+
+def unfilter(raw, stride, height, bpp):
+    """The rows of a PNG image, each with its filter undone."""
+    if len(raw) < (stride + 1) * height:
+        raise BuienError("Buienradar sent a radar image that ends too soon")
+    rows, prior = [], bytearray(stride)
+    for start in range(0, (stride + 1) * height, stride + 1):
+        line = bytearray(raw[start + 1:start + 1 + stride])
+        undo_filter(raw[start], line, prior, bpp)
+        rows.append(line)
+        prior = line
+    return rows
+
+
+def undo_filter(kind, line, prior, bpp):
+    """Undoes one of PNG's five row filters in place: none, sub, up, average or paeth."""
+    if kind == 1:
+        for i in range(bpp, len(line)):
+            line[i] = (line[i] + line[i - bpp]) & 255
+    elif kind == 2:
+        for i in range(len(line)):
+            line[i] = (line[i] + prior[i]) & 255
+    elif kind == 3:
+        for i in range(len(line)):
+            line[i] = (line[i] + (((line[i - bpp] if i >= bpp else 0) + prior[i]) >> 1)) & 255
+    elif kind == 4:
+        for i in range(len(line)):
+            left, up = (line[i - bpp], prior[i - bpp]) if i >= bpp else (0, 0)
+            line[i] = (line[i] + paeth(left, prior[i], up)) & 255
+    elif kind:
+        raise BuienError(f"Buienradar sent a radar image with an unknown filter ({kind})")
+
+
+def paeth(left, up, corner):
+    estimate = left + up - corner
+    to_left, to_up, to_corner = abs(estimate - left), abs(estimate - up), abs(estimate - corner)
+    if to_left <= to_up and to_left <= to_corner:
+        return left
+    return up if to_up <= to_corner else corner
+
+
+SEA, LAND_DARK, LAND_LIGHT, BORDER = range(4)
+MAP_MASK_SIZE = (264, 229)
+RADAR_BOUNDS = (49.5, 54.8, 0.0, 10.0)
+
+
+def shrink_mask(grid, width, height):
+    """grid scaled down to width x height: a border wherever one crosses a pixel, else what covers most of it."""
+    rows = []
+    for top, bottom in spans(len(grid), height):
+        row = []
+        for left, right in spans(len(grid[0]), width):
+            counts = [0, 0, 0, 0]
+            for line in grid[top:bottom]:
+                for value in line[left:right]:
+                    counts[value] += 1
+            row.append(BORDER if counts[BORDER] else counts.index(max(counts[:BORDER])))
+        rows.append(row)
+    return rows
+
+
+def spans(size, parts):
+    """[start, end) of each of parts equal stretches of size, none of them empty."""
+    return [(part * size // parts, max(part * size // parts + 1, (part + 1) * size // parts)) for part in range(parts)]
+
+
+@functools.lru_cache(maxsize=4)
+def map_mask(width, height):
+    """Sea, land and borders of the radar map at width x height pixels."""
+    full_width, full_height = MAP_MASK_SIZE
+    packed = zlib.decompress(base64.b64decode(MAP_MASK))
+    values = [byte >> shift & 3 for byte in packed for shift in (6, 4, 2, 0)]
+    grid = [values[y * full_width:(y + 1) * full_width] for y in range(full_height)]
+    return shrink_mask(grid, width, height)
+
+
+def mercator(lat):
+    return math.log(math.tan(math.pi / 4 + math.radians(lat) / 2))
+
+
+def map_position(place, width, height):
+    """The pixel where place lies on the radar map of width x height, or None when it lies off the map."""
+    south, north, west, east = RADAR_BOUNDS
+    x = int((place.lon - west) / (east - west) * width)
+    y = int((mercator(north) - mercator(place.lat)) / (mercator(north) - mercator(south)) * height)
+    return (x, y) if 0 <= x < width and 0 <= y < height else None
 
 
 def lookup(text, choose=False):
@@ -606,7 +746,7 @@ def axis_line(slots, cell, paint, trip):
 
 
 def time_labels(slots, cell):
-    every = 30 if cell == 2 else 60
+    every = 30 if cell >= 2 else 60
     line = "now"
     for index, slot in enumerate(slots):
         column = index * cell
@@ -617,7 +757,10 @@ def time_labels(slots, cell):
 
 
 def legend(slots, paint):
-    present = {kind_of(slot.mm) for slot in slots if slot.mm > 0}
+    return kinds_legend({kind_of(slot.mm) for slot in slots if slot.mm > 0}, paint)
+
+
+def kinds_legend(present, paint):
     return "  ".join(f"{kind.label} {paint.color('█', kind.color)}" for kind in KINDS if kind in present)
 
 
@@ -639,7 +782,7 @@ def cursor_line(slots, cell, index, paint, room):
 
 def render(place, slots, now, color, width, trip=None, cursor=None):
     paint = Paint(color)
-    cell = 2 if 2 + 2 * len(slots) + 4 <= width else 1
+    cell = max(1, min(MAX_CELL, (width - 6) // len(slots)))
     title = f"{paint.bold(place.name)} {paint.dim('· ' + clock(now))}"
     key = legend(slots, paint)
     gap = max(2, len(slots) * cell - visible_len(title) - visible_len(key))
@@ -679,24 +822,245 @@ def to_json(place, slots, trip=None):
     return data
 
 
-LIVE_KEYS = "←→ time  ↑↓ place  / search  s save  r refresh  q quit"
+RADAR_URL = "https://image.buienradar.nl/2.0/metadata/sprite/RadarMapRainWebmercatorNL?"
+RADAR_SIZE = (1058, 915)
+RADAR_FRAMES = 12
+RADAR_FRESH = timedelta(minutes=5)
+RADAR_RETRY = timedelta(minutes=1)
+RESIZE_WAIT = timedelta(seconds=1)
+RADAR_DEPTHS = (0.3, 0.6, 0.85)
+MAP_COLORS = {SEA: 235, LAND_DARK: 22, LAND_LIGHT: 28, BORDER: 100}
+MAP_SHADES = {SEA: " ", LAND_DARK: ".", LAND_LIGHT: ".", BORDER: ":"}
+RAIN_SHADES = "░░▒▓█"
+MARK_COLOR, HERE_COLOR = 231, 226
+MAP_HOLD = 3
+Frame = namedtuple("Frame", "time rows")
+Mark = namedtuple("Mark", "label place here")
+Cell = namedtuple("Cell", "char fg bg")
+
+
+def fetch_radar(width, height, forecast=RADAR_FRAMES):
+    """Buienradar's rain radar of now and the forecast frames after it, ten minutes apart, at width x height pixels."""
+    meta = fetch_json(RADAR_URL + urllib.parse.urlencode({"history": 1, "forecast": forecast, "skip": 1}))
+    if meta is None:
+        raise BuienError("Buienradar has no radar map right now, try again in a moment")
+    try:
+        times = [utc_to_local(entry["timestamp"]) for entry in meta["times"]]
+        url = sized(meta["sprite"], width, height)
+    except (KeyError, TypeError, ValueError) as error:
+        raise BuienError(f"Buienradar sent an unexpected answer ({error!r})") from error
+    data = fetch_bytes(url)
+    if data is None:
+        raise BuienError("Buienradar has no radar map right now, try again in a moment")
+    picture = decode_png(data)
+    count = min(len(times), picture.width // width)
+    if picture.channels != 4 or picture.height != height or not count:
+        raise BuienError("Buienradar sent a radar map of an unexpected size")
+    stride = width * 4
+    return [Frame(times[index], [row[index * stride:(index + 1) * stride] for row in picture.rows]) for index in range(count)]
+
+
+def sized(url, width, height):
+    """url asking for the rain alone, at width x height pixels."""
+    parts = urllib.parse.urlsplit(url)
+    query = dict(urllib.parse.parse_qsl(parts.query))
+    query.update(width=width, height=height, renderBackground="False", renderBranding="False", renderText="False")
+    return urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(query)))
+
+
+def map_size(columns, rows):
+    """The largest radar map in pixels that fits columns x rows cells at two pixels a cell, in the radar's shape."""
+    width = max(8, min(columns, MAP_MASK_SIZE[0]))
+    height = width * RADAR_SIZE[1] // RADAR_SIZE[0]
+    if height > rows * 2:
+        height = max(4, rows * 2)
+        width = height * RADAR_SIZE[0] // RADAR_SIZE[1]
+    return width, height - height % 2
+
+
+def radar_kind(red, green, blue, alpha):
+    """The kind of rain a radar pixel shows on Buienradar's scale from pale blue through deep blue to purple and red."""
+    if alpha < 100:
+        return None
+    if green < 30 and red > 40:
+        return KINDS[-1]
+    depth = (236 - red) / 231
+    return KINDS[sum(depth >= limit for limit in RADAR_DEPTHS)]
+
+
+def kinds_on(frame):
+    return {kind for row in frame.rows for x in range(0, len(row), 4) for kind in [radar_kind(*row[x:x + 4])] if kind}
+
+
+def map_pixel(frame, mask, x, y):
+    """The kind of rain at a pixel, or else what the map has there: sea, land or a border."""
+    return radar_kind(*frame.rows[y][x * 4:x * 4 + 4]) or mask[y][x]
+
+
+def pixel_color(value):
+    return value.color if isinstance(value, Kind) else MAP_COLORS[value]
+
+
+def pixel_shade(value):
+    return RAIN_SHADES[KINDS.index(value)] if isinstance(value, Kind) else MAP_SHADES[value]
+
+
+def pixel_rank(value):
+    return len(MAP_COLORS) + KINDS.index(value) if isinstance(value, Kind) else value
+
+
+def map_cell(top, bottom, color):
+    """A half block with a pixel in its upper and one in its lower half; without colour, the heavier of the two."""
+    if color:
+        return Cell("▀", pixel_color(top), pixel_color(bottom))
+    return Cell(pixel_shade(max(top, bottom, key=pixel_rank)), None, None)
+
+
+def map_lines(frame, mask, marks, paint):
+    """The frame over the map in half blocks, with the places marked on top."""
+    width, height = len(mask[0]), len(mask)
+    rows = []
+    for y in range(0, height - 1, 2):
+        rows.append([map_cell(map_pixel(frame, mask, x, y), map_pixel(frame, mask, x, y + 1), paint.enabled) for x in range(width)])
+    place_marks(rows, marks, width, height)
+    return [join_cells(cells, paint) for cells in rows]
+
+
+def place_marks(rows, marks, width, height):
+    """A dot for every place, then labels, the place on screen first, each beside its dot where no other one is."""
+    placed = []
+    for mark in sorted(marks, key=lambda mark: not mark.here):
+        position = map_position(mark.place, width, height)
+        if position and position[1] // 2 < len(rows):
+            x, row = position[0], position[1] // 2
+            rows[row][x] = Cell("●", mark_color(mark), rows[row][x].bg)
+            placed.append((mark, x, row))
+    taken = {(row, x) for _, x, row in placed}
+    for mark, x, row in placed:
+        put_label(rows[row], row, mark, x, taken)
+
+
+def put_label(cells, row, mark, x, taken):
+    """The label after the dot, or before it when there is no room after it; left out when neither side is free."""
+    text = f" {mark.label}"
+    for start in (x + 1, x - len(text)):
+        spots = [(row, column) for column in range(start, start + len(text))]
+        if start >= 0 and start + len(text) <= len(cells) and not taken.intersection(spots):
+            label = text if start > x else text[1:] + " "
+            for (_, column), char in zip(spots, label):
+                cells[column] = Cell(char, mark_color(mark), cells[column].bg)
+            taken.update(spots)
+            return
+
+
+def mark_color(mark):
+    return HERE_COLOR if mark.here else MARK_COLOR
+
+
+def join_cells(cells, paint):
+    if not paint.enabled:
+        return "".join(cell.char for cell in cells).rstrip()
+    runs = itertools.groupby(cells, key=lambda cell: (cell.fg, cell.bg))
+    return "".join(f"\033[38;5;{fg};48;5;{bg}m" + "".join(cell.char for cell in run) for (fg, bg), run in runs) + "\033[0m"
+
+
+def render_map(frame, now, marks, paint):
+    """The title with the frame's time and the kinds of rain on it, then the map."""
+    mask = map_mask(len(frame.rows[0]) // 4, len(frame.rows))
+    minutes = round((frame.time - now).total_seconds() / 60)
+    when = "now" if abs(minutes) < 5 else f"in {duration(minutes)}" if minutes > 0 else f"{duration(-minutes)} ago"
+    title = f"{paint.bold('Radar')} {paint.dim(f'· {clock(frame.time)} · {when}')}"
+    key = kinds_legend(kinds_on(frame), paint) or paint.dim("no rain on the radar")
+    gap = max(2, len(mask[0]) - visible_len(title) - visible_len(key))
+    lines = ["", f"  {title}{' ' * gap}{key}".rstrip(), ""]
+    return lines + [f"  {line}" for line in map_lines(frame, mask, marks, paint)]
+
+
+def saved_marks(here):
+    """A mark for every saved place and one for here, under its saved name when it has one."""
+    places = load_places()
+    marks = [Mark(name, place, False) for name, place in places.items() if place != here]
+    names = [name for name in home_first(places) if places[name] == here]
+    return marks + [Mark(names[0] if names else here.name.split(",")[0], here, True)]
+
+
+def live_layout(columns, lines):
+    """The map beside the chart when the terminal is wide enough, else above it, or none at all when it is small."""
+    room = columns - CHART_WIDTH - 4
+    if room >= BESIDE_MIN_MAP and lines - BESIDE_RESERVED >= MIN_MAP_ROWS:
+        return Layout(True, map_size(room, lines - BESIDE_RESERVED))
+    if lines - MAP_RESERVED < MIN_MAP_ROWS:
+        return Layout(False, None)
+    return Layout(False, map_size(columns - 4, lines - MAP_RESERVED))
+
+
+def chart_width(layout, columns):
+    """What the chart has left: the whole width, or what the map leaves beside it."""
+    return columns - layout.map_size[0] - 4 if layout.beside else columns
+
+
+def compose(map_lines, chart_lines, layout, columns):
+    """The map's lines beside the chart's, or centred above them."""
+    if not map_lines:
+        return chart_lines
+    width = layout.map_size[0] + 2
+    if not layout.beside:
+        return [" " * max(0, (columns - width) // 2) + line for line in map_lines] + chart_lines
+    rows = max(len(map_lines), len(chart_lines))
+    lefts = [fit(line, width) for line in map_lines + [""] * (rows - len(map_lines))]
+    rights = chart_lines + [""] * (rows - len(chart_lines))
+    return [left + " " * (width - visible_len(left) + 2) + right for left, right in zip(lefts, rights)]
+
+
+def snapshot_map(place, size, color):
+    """The radar of now with your places on it, at size; nothing when Buienradar gives none."""
+    try:
+        frames = fetch_radar(*size, forecast=0)
+    except BuienError as error:
+        warn(f"no radar map ({error})")
+        return []
+    return render_map(frames[0], datetime.now().astimezone(), saved_marks(place), Paint(color))
+
+
+def nearest(items, moment):
+    """The index of the item whose time lies closest to moment."""
+    return min(range(len(items)), key=lambda index: abs(items[index].time - moment))
+
+
+LIVE_KEYS = "←→ time  space play  ↑↓ place  / search  s save  r refresh  q quit"
+MAP_RESERVED = 21
+BESIDE_RESERVED = 6
+MIN_MAP_ROWS = 6
+CHART_WIDTH = 78
+BESIDE_MIN_MAP = 50
+Layout = namedtuple("Layout", "beside map_size")
 MENU_KEYS = "↑↓ choose  enter open  esc back"
 LIVE_TICK = 0.5
-ENTER_SCREEN = "\033[?1049h\033[?25l"
-LEAVE_SCREEN = "\033[?25h\033[?1049l"
+ENTER_SCREEN = "\033[?1049h\033[?25l\033[?1000h\033[?1006h"
+LEAVE_SCREEN = "\033[?1006l\033[?1000l\033[?25h\033[?1049l"
 KEY_NAMES = {
     "\033[A": "up", "\033OA": "up", "\033[B": "down", "\033OB": "down",
     "\033[C": "right", "\033OC": "right", "\033[D": "left", "\033OD": "left",
     "\t": "tab", "\033[Z": "shift-tab", "\r": "enter", "\n": "enter",
     "\033": "esc", "\x7f": "backspace", "\x08": "backspace",
 }
-KEYS = re.compile(r"\033\[[0-9;]*[A-Za-z~]|\033O[A-Za-z]|\033[^\[O\033]|\033|.", re.DOTALL)
-CUT_SEQUENCE = re.compile(rb"\033(\[[0-9;]*|O)?$")
+KEYS = re.compile(r"\033\[<[0-9;]*[Mm]|\033\[[0-9;]*[A-Za-z~]|\033O[A-Za-z]|\033[^\[O\033]|\033|.", re.DOTALL)
+OLD_MOUSE = re.compile(rb"\033\[M(.)(.)(.)", re.DOTALL)
+CUT_SEQUENCE = re.compile(rb"\033(\[<?[0-9;]*|\[M.{0,2}|O)?$", re.DOTALL)
+MOUSE = re.compile(r"\033\[<(\d+);\d+;\d+[Mm]")
+WHEEL = {64: "wheel-up", 65: "wheel-down"}
 
 
 def parse_keys(text):
-    """Names such as 'left' or 'enter' for what the terminal sent; plain characters stay as they are."""
-    return [KEY_NAMES.get(key, key) for key in KEYS.findall(text)]
+    """Names such as 'left', 'enter' or 'wheel-up' for what the terminal sent; plain characters stay as they are."""
+    return [key_name(key) for key in KEYS.findall(text)]
+
+
+def key_name(key):
+    mouse = MOUSE.fullmatch(key)
+    if mouse:
+        return WHEEL.get(int(mouse[1]), "mouse")
+    return KEY_NAMES.get(key, key)
 
 
 def read_keys(fd):
@@ -704,6 +1068,7 @@ def read_keys(fd):
     data = os.read(fd, 1024)
     while cut_short(data) and select.select([fd], [], [], 0.05)[0]:
         data += os.read(fd, 1024)
+    data = OLD_MOUSE.sub(lambda event: b"\033[<%d;%d;%dM" % tuple(byte[0] - 32 for byte in event.groups()), data)
     return parse_keys(data.decode(errors="ignore"))
 
 
@@ -751,6 +1116,39 @@ class Loaded:
     note: str = ""
 
 
+class Radar:
+    """The radar frames the live screen plays: loaded for the terminal's size, and again every five minutes."""
+
+    def __init__(self, fetch=None):
+        self.fetch = fetch or fetch_radar
+        self.frames = None
+        self.error = None
+        self.size = None
+        self.loaded_at = None
+
+    def due(self, now, size):
+        return self.frames is None or self.size != size or not (self.loaded_at and timedelta(0) <= now - self.loaded_at < RADAR_FRESH)
+
+    def load(self, now, size):
+        """Loads the frames; when that fails, frames that still fit stay, and the next try is a minute away."""
+        try:
+            frames = self.fetch(*size)
+        except BuienError as error:
+            self.error = error
+            if not (isinstance(self.frames, list) and self.size == size):
+                self.frames = error
+            self.loaded_at = now - RADAR_FRESH + RADAR_RETRY
+        else:
+            self.frames, self.error, self.loaded_at = frames, None, now
+        self.size = size
+
+    def note(self):
+        """What to tell about a reload that failed while older frames stay on screen."""
+        if self.error and isinstance(self.frames, list):
+            return f"no new radar ({self.error}), showing the one from {clock(self.frames[0].time)}"
+        return ""
+
+
 @dataclass
 class Prompt:
     label: str
@@ -760,7 +1158,7 @@ class Prompt:
 class Live:
     """What buien --live shows: a tab per place, a cursor over the chart, and a prompt or a menu when asked."""
 
-    def __init__(self, tabs, trip_minutes=None, fetch=None, search=None):
+    def __init__(self, tabs, trip_minutes=None, fetch=None, search=None, radar=None):
         self.tabs = tabs
         self.index = 0
         self.trip_minutes = trip_minutes
@@ -773,12 +1171,37 @@ class Live:
         self.menu = []
         self.choice = 0
         self.message = ""
+        self.radar = radar or Radar()
+        self.playing = True
+        self.step = 0
+        self.resized = None
+        self.drawn = (None, [])
 
     @property
     def tab(self):
         return self.tabs[self.index]
 
-    def update(self, now):
+    def update(self, now, size=None):
+        """Loads one thing the screen needs, the forecast first, so it is drawn before the radar; True when it did."""
+        if self.load_forecast(now):
+            return True
+        wanted = live_layout(size.columns, size.lines).map_size if size else None
+        if not wanted:
+            return False
+        if not self.radar.due(now, wanted) or not self.settled(now, wanted):
+            return False
+        self.radar.load(now, wanted)
+        return True
+
+    def settled(self, now, wanted):
+        """True when the radar has no frames yet, or the terminal has kept this new size for a moment."""
+        if not isinstance(self.radar.frames, list) or self.radar.size == wanted:
+            return True
+        if self.resized is None or self.resized[0] != wanted:
+            self.resized = (wanted, now)
+        return now - self.resized[1] >= RESIZE_WAIT
+
+    def load_forecast(self, now):
         """Loads the forecast of the tab on screen once a minute, or right away after r; True when it did."""
         loaded = self.loaded.get(self.index)
         if loaded and not self.fresh and clock(loaded.when) == clock(now):
@@ -825,19 +1248,55 @@ class Live:
             self.menu_key(key)
         elif key in ("q", "esc"):
             return False
-        elif key in ("left", "right"):
-            self.move_cursor(-1 if key == "left" else 1)
+        else:
+            self.view_key(key)
+        return True
+
+    def view_key(self, key):
+        """A key on the map and the chart."""
+        if key in ("left", "right", "wheel-up", "wheel-down"):
+            self.playing = False
+            self.move_cursor(-1 if key in ("left", "wheel-up") else 1)
+        elif key == " ":
+            self.toggle_play()
         elif key in ("up", "down", "tab", "shift-tab"):
             self.index = (self.index + (-1 if key in ("up", "shift-tab") else 1)) % len(self.tabs)
             self.cursor = 0
         elif key == "r":
             self.loaded.pop(self.index, None)
+            self.radar.loaded_at = None
             self.fresh = True
         elif key == "/":
             self.prompt = Prompt("search")
         elif key == "s":
             self.ask_name()
-        return True
+
+    def toggle_play(self):
+        """Pauses the map, or plays it on from the frame on screen."""
+        if isinstance(self.radar.frames, list):
+            self.step = self.frame_index()
+        self.playing = not self.playing
+
+    def tick(self):
+        """Half a second without keys: while playing, the map shows its next frame and the cursor follows it."""
+        frames = self.radar.frames
+        if not self.playing or not isinstance(frames, list):
+            return
+        self.step += 1
+        slots = self.slots()
+        if slots:
+            self.cursor = nearest(slots, frames[self.frame_index()].time)
+
+    def frame_index(self):
+        """While playing each frame in turn with the last held a moment, paused the one at the cursor's time."""
+        frames, slots = self.radar.frames, self.slots()
+        if self.playing or not slots:
+            return min(self.step % (len(frames) + MAP_HOLD), len(frames) - 1)
+        return nearest(frames, slots[min(self.cursor, len(slots) - 1)].time)
+
+    def slots(self):
+        loaded = self.loaded.get(self.index)
+        return loaded.slots if loaded and isinstance(loaded.slots, list) else []
 
     def move_cursor(self, step):
         loaded = self.loaded.get(self.index)
@@ -897,10 +1356,16 @@ class Live:
     def screen(self, now, width, height, color):
         """Every line of the terminal, each cut to its width, with a note and the keys at the bottom."""
         paint = Paint(color)
-        body = self.menu_lines(paint) if self.menu else self.chart_lines(now, width, paint)
         loaded = self.loaded.get(self.index)
-        note = self.message or (loaded.note if loaded else "")
+        note = self.message or "; ".join(filter(None, [loaded.note if loaded else "", self.radar.note()]))
         bottom = [f" {note}", self.bottom_line(paint)] if note else [self.bottom_line(paint)]
+        if self.menu:
+            body = self.menu_lines(paint)
+        else:
+            layout = live_layout(width, height)
+            chart = self.chart_lines(now, chart_width(layout, width) if layout.map_size else width, paint)
+            room = height - len(bottom) - 1 - (0 if layout.beside else len(chart))
+            body = compose(self.map_lines(now, paint, room) if layout.map_size else [], chart, layout, width)
         lines = ([self.tab_line(paint)] + body)[:max(0, height - len(bottom))]
         lines += [""] * (height - len(bottom) - len(lines)) + bottom
         return [fit(line, width) for line in lines[-height:]]
@@ -924,6 +1389,22 @@ class Live:
             return ["", f"  {paint.bold(self.tab.place.name)}", "", f"  {loaded.slots}"]
         cursor = min(self.cursor, len(loaded.slots) - 1)
         return render(self.tab.place, loaded.slots, now, paint.enabled, width, loaded.trip, cursor).split("\n")
+
+    def map_lines(self, now, paint, room):
+        """The radar frame on screen with every tab's place on it, in the room the chart leaves."""
+        frames = self.radar.frames
+        if room < MIN_MAP_ROWS + 3:
+            return []
+        if frames is None:
+            return ["", f"  {paint.dim('fetching the radar')}"]
+        if isinstance(frames, BuienError):
+            return ["", f"  {paint.bold('Radar')} {paint.dim(str(frames))}"]
+        index = self.frame_index()
+        marks = tuple(Mark(tab.label, tab.place, number == self.index) for number, tab in enumerate(self.tabs))
+        key = (id(frames), index, marks, paint.enabled, clock(now))
+        if self.drawn[0] != key:
+            self.drawn = (key, render_map(frames[index], now, marks, paint))
+        return self.drawn[1][:room]
 
     def menu_lines(self, paint):
         lines = ["", f"  {paint.bold('Which one?')}", ""]
@@ -1010,12 +1491,14 @@ def live_loop(live, terminal, color):
         now = datetime.now().astimezone()
         size = shutil.get_terminal_size()
         terminal.draw(live.screen(now, size.columns, size.lines, color))
-        if live.update(now):
+        if live.update(now, size):
             continue
-        if select.select([terminal.fd], [], [], LIVE_TICK)[0]:
-            for key in read_keys(terminal.fd):
-                if not live.key(key):
-                    return
+        if not select.select([terminal.fd], [], [], LIVE_TICK)[0]:
+            live.tick()
+            continue
+        for key in read_keys(terminal.fd):
+            if not live.key(key):
+                return
 
 
 def completion_script(shell):
@@ -1124,6 +1607,8 @@ def parse_args(argv):
             options.trip = parse_minutes(next(args, ""))
         elif arg == "--live":
             options.live = True
+        elif arg == "--once":
+            options.once = True
         elif arg.startswith("-") and not COORDS.match(arg):
             raise BuienError(f"unknown option {arg}, see buien -h")
         else:
@@ -1155,7 +1640,7 @@ def run(options):
             raise BuienError("say which place to forget, e.g. buien --forget work")
         forget_place(" ".join(options.words))
         return 0
-    if options.live:
+    if wants_live(options):
         return live_mode(options)
     place = resolve_place(options)
     if place is None:
@@ -1167,13 +1652,27 @@ def run(options):
     return 2 if trip and options.short and not trip.leave_now else 0
 
 
+def wants_live(options):
+    """--live, or plain buien in a terminal; --once, --short, --json and a pipe get text."""
+    if options.live:
+        return True
+    if options.once or options.short or options.as_json:
+        return False
+    return termios is not None and sys.stdin.isatty() and sys.stdout.isatty()
+
+
 def show(options, place, slots, now, trip):
     if options.as_json:
         print(json.dumps(to_json(place, slots, trip), ensure_ascii=False, indent=2))
     elif options.short:
         print(describe_trip(trip, slots) if trip else summarize(slots))
     else:
-        print(render(place, slots, now, use_color(options), shutil.get_terminal_size().columns, trip))
+        size, color = shutil.get_terminal_size(), use_color(options)
+        layout = live_layout(size.columns, size.lines) if sys.stdout.isatty() else Layout(False, None)
+        columns = chart_width(layout, size.columns) if layout.map_size else size.columns
+        chart = render(place, slots, now, color, columns, trip).split("\n")
+        above = snapshot_map(place, layout.map_size, color) if layout.map_size else []
+        print("\n".join(compose(above, chart, layout, size.columns)))
 
 
 def main(argv=None):
@@ -1185,6 +1684,44 @@ def main(argv=None):
     except KeyboardInterrupt:
         print(file=sys.stderr)
         return 130
+
+
+# Made by tools/make-map-mask.py from the map's own background on a dry day:
+# MAP_MASK_SIZE pixels of SEA, LAND_DARK, LAND_LIGHT or BORDER, four to a byte.
+MAP_MASK = (
+    "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"
+    "c3h4f6yP+2z9H3T9DBg="
+)
 
 
 if __name__ == "__main__":

@@ -7,11 +7,13 @@ import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
 import unittest
 import urllib.error
+import zlib
 from datetime import datetime, timedelta, timezone
 from unittest import mock
 
@@ -608,6 +610,24 @@ class LiveTest(LiveCase):
                 mock.patch.object(buien.select, "select", return_value=([0], [], [])):
             self.assertEqual(buien.read_keys(0), ["L", "i", "è", "g", "e"])
 
+    def test_the_mouse_wheel_moves_through_the_hours_and_clicks_do_nothing(self):
+        keys = buien.parse_keys("\033[<65;10;5M\033[<65;10;5M\033[<64;10;5M\033[<0;3;4M\033[<0;3;4m")
+        self.assertEqual(keys, ["wheel-down", "wheel-down", "wheel-up", "mouse", "mouse"])
+        self.assertEqual(self.press(*keys), [True] * 5)
+        self.assertEqual(self.live.cursor, 1)
+        self.assertFalse(self.live.playing)
+
+    def test_the_older_mouse_format_never_reads_as_keys(self):
+        events = b"\033[Ma!!\033[M`\xf0!\033[M qqq"
+        with mock.patch.object(buien.os, "read", return_value=events), \
+                mock.patch.object(buien.select, "select", return_value=([], [], [])):
+            self.assertEqual(buien.read_keys(0), ["wheel-down", "wheel-up", "mouse", "q"])
+
+    def test_a_wheel_event_cut_in_two_by_a_read_is_completed(self):
+        with mock.patch.object(buien.os, "read", side_effect=[b"\033[<65;1", b"0;5M"]), \
+                mock.patch.object(buien.select, "select", return_value=([0], [], [])):
+            self.assertEqual(buien.read_keys(0), ["wheel-down"])
+
     def test_alt_with_a_key_is_one_key_that_does_nothing(self):
         self.assertEqual(buien.parse_keys("\033b\033\033"), ["\033b", "esc", "esc"])
         self.assertEqual(self.press("\033b"), [True])
@@ -727,6 +747,124 @@ class LiveTest(LiveCase):
         self.assertEqual(live.index, 1)
 
 
+class LiveMapTest(LiveCase):
+    TALL = os.terminal_size((100, 40))
+
+    def setUp(self):
+        super().setUp()
+        self.frames = [buien.Frame(START + timedelta(minutes=minutes), radar_rows(8, 6)) for minutes in (0, 10, 20)]
+        self.fetch_radar = mock.Mock(return_value=self.frames)
+        self.live = buien.Live([buien.Tab("home", GENT), buien.Tab("work", BRUSSEL)], fetch=self.fetch,
+                               radar=buien.Radar(fetch=self.fetch_radar))
+        self.load()
+
+    def text(self, height=40):
+        return "\n".join(plain(line) for line in self.live.screen(self.NOW, 100, height, False))
+
+    def test_a_tall_terminal_shows_the_map_above_the_chart(self):
+        text = self.text()
+        self.assertLess(text.index("Radar · 12:30"), text.index("Gent · 12:33"))
+        width, height = self.fetch_radar.call_args.args
+        self.assertEqual((width, height), buien.map_size(96, 40 - buien.MAP_RESERVED))
+
+    def test_a_short_terminal_shows_the_chart_alone(self):
+        self.fetch_radar.reset_mock()
+        live = buien.Live([buien.Tab("home", GENT)], fetch=self.fetch, radar=buien.Radar(fetch=self.fetch_radar))
+        live.update(self.NOW, os.terminal_size((100, 24)))
+        self.fetch_radar.assert_not_called()
+        self.assertNotIn("Radar", "\n".join(live.screen(self.NOW, 100, 24, False)))
+
+    def test_playing_moves_the_map_and_the_cursor_along(self):
+        self.live.tick()
+        self.live.tick()
+        self.assertIn("Radar · 12:50", self.text())
+        self.assertEqual(self.live.cursor, 4)
+        for _ in range(buien.MAP_HOLD):
+            self.live.tick()
+        self.assertIn("Radar · 12:50", self.text())
+        self.live.tick()
+        self.assertIn("Radar · 12:30", self.text())
+
+    def test_arrows_pause_and_the_map_follows_the_cursor(self):
+        self.press("right", "right")
+        self.assertFalse(self.live.playing)
+        self.assertIn("Radar · 12:40", self.text())
+        self.live.tick()
+        self.assertIn("Radar · 12:40", self.text())
+
+    def test_space_plays_on_from_the_frame_on_screen(self):
+        self.press("right", "right", " ")
+        self.assertTrue(self.live.playing)
+        self.assertIn("Radar · 12:40", self.text())
+        self.live.tick()
+        self.assertIn("Radar · 12:50", self.text())
+
+    def test_the_radar_is_loaded_again_after_five_minutes(self):
+        self.load(later=4 * 60)
+        self.assertEqual(self.fetch_radar.call_count, 1)
+        self.load(later=5 * 60)
+        self.assertEqual(self.fetch_radar.call_count, 2)
+
+    def load(self, later=0, size=None):
+        """Updates until nothing is left to load, as the live loop does."""
+        while self.live.update(self.NOW + timedelta(seconds=later), size or self.TALL):
+            pass
+
+    def test_r_fetches_the_radar_again_and_keeps_the_map_meanwhile(self):
+        self.press("r")
+        self.assertIn("Radar · 12:30", self.text())
+        self.load()
+        self.assertEqual(self.fetch_radar.call_count, 2)
+
+    def test_the_forecast_is_drawn_before_the_radar_loads(self):
+        live = buien.Live([buien.Tab("home", GENT)], fetch=self.fetch, radar=buien.Radar(fetch=self.fetch_radar))
+        self.assertTrue(live.update(self.NOW, self.TALL))
+        self.assertIsNone(live.radar.frames)
+        text = "\n".join(plain(line) for line in live.screen(self.NOW, 100, 40, False))
+        self.assertIn("fetching the radar", text)
+        self.assertIn("Gent · 12:33", text)
+
+    def test_a_radar_that_fails_says_so_above_the_chart(self):
+        live = buien.Live([buien.Tab("home", GENT)], fetch=self.fetch,
+                          radar=buien.Radar(fetch=mock.Mock(side_effect=buien.BuienError("Buienradar has no radar map right now"))))
+        while live.update(self.NOW, self.TALL):
+            pass
+        text = "\n".join(plain(line) for line in live.screen(self.NOW, 100, 40, False))
+        self.assertIn("Radar Buienradar has no radar map right now", text)
+        self.assertIn("Gent · 12:33", text)
+
+    def test_a_reload_that_fails_keeps_the_map_and_tries_again_in_a_minute(self):
+        self.fetch_radar.side_effect = buien.BuienError("graphdata is unreachable")
+        self.load(later=5 * 60)
+        self.assertIn("Radar · 12:30", self.text())
+        self.assertIn("no new radar (graphdata is unreachable), showing the one from 12:30", self.text())
+        self.load(later=5 * 60 + 30)
+        self.assertEqual(self.fetch_radar.call_count, 2)
+        self.fetch_radar.side_effect = None
+        self.load(later=6 * 60)
+        self.assertEqual(self.fetch_radar.call_count, 3)
+        self.assertNotIn("no new radar", self.text())
+
+    def test_a_new_size_loads_once_the_terminal_holds_still(self):
+        wide = os.terminal_size((120, 50))
+        self.load(later=0, size=wide)
+        self.assertEqual(self.fetch_radar.call_count, 1)
+        self.load(later=0.5, size=os.terminal_size((130, 50)))
+        self.assertEqual(self.fetch_radar.call_count, 1)
+        self.load(later=2, size=os.terminal_size((130, 50)))
+        self.assertEqual(self.fetch_radar.call_count, 2)
+
+    def test_the_chart_is_never_cut_for_the_map(self):
+        self.live.trip_minutes = 25
+        self.live.loaded.clear()
+        self.fetch.return_value = slots(0, 0, 1.5, 6, *[0] * 20)
+        self.load()
+        lines = [plain(line) for line in self.live.screen(self.NOW, 100, 40, False)]
+        self.assertEqual(len(lines), 40)
+        self.assertIn("heaviest at 12:45: 6.0 mm per hour", "\n".join(lines))
+        self.assertIn("leave from 12:50 to stay dry for 25 min", "\n".join(lines))
+
+
 class LiveSearchTest(LiveCase):
     def test_search_opens_a_single_match_right_away(self):
         self.live.search = mock.Mock(return_value=[MONS])
@@ -782,6 +920,202 @@ class LiveSearchTest(LiveCase):
         with mock.patch.object(buien, "write_places", side_effect=PermissionError("read-only file system")):
             self.press("/", *"bergen", "enter", "s", *"mons", "enter")
         self.assertEqual(self.screen()[-2], " read-only file system")
+
+
+def encode_png(rows, kind=0, channels=4):
+    """A PNG of rows of pixel bytes, each row put through filter kind, for the decoder to undo."""
+    raw, prior = bytearray(), bytes(len(rows[0]))
+    for row in rows:
+        raw.append(kind)
+        raw += png_filter(kind, bytes(row), prior, channels)
+        prior = bytes(row)
+    header = struct.pack(">IIBBBBB", len(rows[0]) // channels, len(rows), 8, 6 if channels == 4 else 2, 0, 0, 0)
+    return buien.PNG_SIGNATURE + png_chunk(b"IHDR", header) + png_chunk(b"IDAT", zlib.compress(bytes(raw))) + png_chunk(b"IEND", b"")
+
+
+def png_chunk(kind, body):
+    return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body))
+
+
+def png_filter(kind, row, prior, bpp):
+    filtered = bytearray()
+    for i, value in enumerate(row):
+        left, corner = (row[i - bpp], prior[i - bpp]) if i >= bpp else (0, 0)
+        up = prior[i]
+        estimate = left + up - corner
+        nearest = min((abs(estimate - left), 0, left), (abs(estimate - up), 1, up), (abs(estimate - corner), 2, corner))[2]
+        filtered.append((value - [0, left, up, (left + up) // 2, nearest][kind]) & 255)
+    return filtered
+
+
+DEEP_BLUE, PALE_BLUE, RED, DRY = (5, 27, 208, 204), (236, 237, 253, 203), (252, 22, 1, 204), (0, 0, 0, 0)
+
+
+def radar_rows(width, height, rain=None):
+    """Rows of RGBA bytes, dry but for rain, a dict of (x, y) to a pixel."""
+    rain = rain or {}
+    return [bytearray(b"".join(bytes(rain.get((x, y), DRY)) for x in range(width))) for y in range(height)]
+
+
+class PngTest(unittest.TestCase):
+    ROWS = [bytes(range(i, i + 12)) for i in (3, 90, 200)]
+
+    def test_every_row_filter_is_undone(self):
+        for kind in range(5):
+            with self.subTest(kind=kind):
+                picture = buien.decode_png(encode_png(self.ROWS, kind))
+                self.assertEqual((picture.width, picture.height, picture.channels), (3, 3, 4))
+                self.assertEqual([bytes(row) for row in picture.rows], self.ROWS)
+
+    def test_rgb_without_alpha(self):
+        picture = buien.decode_png(encode_png(self.ROWS, 4, channels=3))
+        self.assertEqual((picture.width, picture.channels), (4, 3))
+        self.assertEqual([bytes(row) for row in picture.rows], self.ROWS)
+
+    def test_not_a_png(self):
+        with self.assertRaisesRegex(buien.BuienError, "not a PNG"):
+            buien.decode_png(b"GIF89a")
+
+    def test_a_short_header(self):
+        with self.assertRaisesRegex(buien.BuienError, "cannot read"):
+            buien.decode_png(buien.PNG_SIGNATURE + png_chunk(b"IHDR", b"\x00\x01"))
+
+    def test_a_kind_buien_cannot_read(self):
+        palette = struct.pack(">IIBBBBB", 1, 1, 8, 3, 0, 0, 0)
+        with self.assertRaisesRegex(buien.BuienError, "cannot read"):
+            buien.decode_png(buien.PNG_SIGNATURE + png_chunk(b"IHDR", palette))
+
+    def test_a_broken_image(self):
+        header = struct.pack(">IIBBBBB", 1, 1, 8, 6, 0, 0, 0)
+        with self.assertRaisesRegex(buien.BuienError, "broken radar image"):
+            buien.decode_png(buien.PNG_SIGNATURE + png_chunk(b"IHDR", header) + png_chunk(b"IDAT", b"not zlib"))
+
+
+class MapTest(unittest.TestCase):
+    def test_the_mask_has_its_size(self):
+        mask = buien.map_mask(*buien.MAP_MASK_SIZE)
+        self.assertEqual((len(mask[0]), len(mask)), buien.MAP_MASK_SIZE)
+
+    def test_places_land_where_they_lie(self):
+        width, height = buien.MAP_MASK_SIZE
+        mask = buien.map_mask(width, height)
+        places = {
+            "Buggenhout": (buien.Place("Buggenhout", 51.016, 4.202), buien.LAND_LIGHT),
+            "Utrecht": (buien.Place("Utrecht", 52.09, 5.12), buien.LAND_DARK),
+            "Sauerland": (buien.Place("Sauerland", 51.2, 8.0), buien.LAND_LIGHT),
+            "Lille": (buien.Place("Lille", 50.63, 3.06), buien.LAND_DARK),
+            "North Sea": (buien.Place("North Sea", 53.0, 3.0), buien.SEA),
+        }
+        for name, (place, land) in places.items():
+            with self.subTest(name):
+                x, y = buien.map_position(place, width, height)
+                self.assertEqual(mask[y][x], land)
+
+    def test_off_the_map(self):
+        self.assertIsNone(buien.map_position(buien.Place("Madrid", 40.4, -3.7), 100, 86))
+        self.assertIsNone(buien.map_position(buien.Place("London", 51.5, -0.12), 100, 86))
+
+    def test_north_is_up_and_stretched_as_on_a_web_map(self):
+        ys = [buien.map_position(buien.Place("", lat, 5.0), 264, 229)[1] for lat in (50, 52, 54)]
+        self.assertGreater(ys[0], ys[1])
+        self.assertGreater(ys[1] - ys[2], 0)
+        self.assertGreater(ys[0] - ys[1], 0)
+        steps = [buien.mercator(lat + 1) - buien.mercator(lat) for lat in (50, 53)]
+        self.assertGreater(steps[1], steps[0])
+
+    def test_the_map_fits_the_terminal_in_its_own_shape(self):
+        self.assertEqual(buien.map_size(500, 500), (264, 228))
+        width, height = buien.map_size(200, 20)
+        self.assertEqual(height, 40)
+        self.assertAlmostEqual(width / height, 1058 / 915, delta=0.05)
+        self.assertEqual(buien.map_size(60, 100)[1] % 2, 0)
+
+    def test_shrinking_keeps_a_thin_border(self):
+        grid = [[buien.SEA, buien.BORDER, buien.LAND_DARK, buien.LAND_DARK]] * 4
+        self.assertEqual(buien.shrink_mask(grid, 2, 2), [[buien.BORDER, buien.LAND_DARK]] * 2)
+
+
+class RadarTest(unittest.TestCase):
+    NOW = datetime(2026, 10, 13, 10, 32, tzinfo=timezone.utc).astimezone()
+
+    def test_kinds_of_rain_by_colour(self):
+        self.assertIsNone(buien.radar_kind(*DRY))
+        self.assertEqual(buien.radar_kind(*PALE_BLUE).name, "drizzle")
+        self.assertEqual(buien.radar_kind(120, 128, 255, 204).name, "light rain")
+        self.assertEqual(buien.radar_kind(*DEEP_BLUE).name, "heavy rain")
+        self.assertEqual(buien.radar_kind(*RED).name, "very heavy rain")
+
+    def test_a_sprite_is_cut_into_frames(self):
+        meta = {"times": [{"timestamp": "2026-10-13T10:30:00"}, {"timestamp": "2026-10-13T10:40:00"}],
+                "sprite": "https://image.buienradar.nl/2.0/image/sprite/X?width=1058&height=915&renderBackground=True&history=1"}
+        sprite = encode_png(radar_rows(4, 2, {(2, 1): DEEP_BLUE}))
+        with mock.patch.object(buien, "fetch_json", return_value=meta), \
+                mock.patch.object(buien, "fetch_bytes", return_value=sprite) as fetch_bytes:
+            frames = buien.fetch_radar(2, 2)
+        url = fetch_bytes.call_args.args[0]
+        self.assertIn("width=2&height=2&renderBackground=False", url)
+        self.assertIn("history=1", url)
+        self.assertEqual([frame.time for frame in frames], [self.NOW.replace(minute=30), self.NOW.replace(minute=40)])
+        self.assertEqual(buien.kinds_on(frames[0]), set())
+        self.assertEqual(bytes(frames[1].rows[1][:4]), bytes(DEEP_BLUE))
+
+    def test_no_radar_map(self):
+        with mock.patch.object(buien, "fetch_json", return_value=None):
+            with self.assertRaisesRegex(buien.BuienError, "no radar map right now"):
+                buien.fetch_radar(2, 2)
+
+    def test_a_sprite_of_another_size(self):
+        meta = {"times": [{"timestamp": "2026-10-13T10:30:00"}], "sprite": "https://image.buienradar.nl/x?width=1"}
+        with mock.patch.object(buien, "fetch_json", return_value=meta), \
+                mock.patch.object(buien, "fetch_bytes", return_value=encode_png(radar_rows(2, 3))):
+            with self.assertRaisesRegex(buien.BuienError, "unexpected size"):
+                buien.fetch_radar(2, 2)
+
+    def test_half_blocks_carry_two_pixels_with_rain_over_the_map(self):
+        mask = [[buien.SEA, buien.LAND_DARK], [buien.BORDER, buien.LAND_LIGHT]]
+        frame = buien.Frame(self.NOW, radar_rows(2, 2, {(1, 0): DEEP_BLUE}))
+        line, = buien.map_lines(frame, mask, [], buien.Paint(True))
+        colors = buien.MAP_COLORS
+        self.assertIn(f"\033[38;5;{colors[buien.SEA]};48;5;{colors[buien.BORDER]}m▀", line)
+        self.assertIn(f"\033[38;5;{buien.KINDS[3].color};48;5;{colors[buien.LAND_LIGHT]}m▀", line)
+
+    def test_without_colour_the_heavier_pixel_shows(self):
+        mask = [[buien.SEA, buien.LAND_DARK, buien.SEA], [buien.BORDER, buien.LAND_LIGHT, buien.SEA]]
+        frame = buien.Frame(self.NOW, radar_rows(3, 2, {(1, 1): RED}))
+        self.assertEqual(buien.map_lines(frame, mask, [], buien.Paint(False)), [":█"])
+
+    def test_places_are_marked_with_their_label(self):
+        mask = [[buien.SEA] * 20 for _ in range(10)]
+        frame = buien.Frame(self.NOW, radar_rows(20, 10))
+        marks = [buien.Mark("west", buien.Place("", 53.0, 0.0), False), buien.Mark("east", buien.Place("", 51.0, 9.95), True)]
+        lines = buien.map_lines(frame, mask, marks, buien.Paint(False))
+        self.assertEqual(lines[1], "● west")
+        self.assertEqual(lines[3], " " * 14 + "east ●")
+        colored = "".join(buien.map_lines(frame, mask, marks, buien.Paint(True)))
+        self.assertIn(f"\033[38;5;{buien.HERE_COLOR};48;5;{buien.MAP_COLORS[buien.SEA]}meast ●", colored)
+
+    def test_labels_of_places_close_together_do_not_run_into_each_other(self):
+        mask = [[buien.SEA] * 20 for _ in range(10)]
+        frame = buien.Frame(self.NOW, radar_rows(20, 10))
+        marks = [buien.Mark("gent", buien.Place("", 51.0, 3.7), False), buien.Mark("home", buien.Place("", 51.0, 4.2), True)]
+        line = buien.map_lines(frame, mask, marks, buien.Paint(False))[3]
+        self.assertEqual(line, "  gent ●● home")
+        marks[0] = buien.Mark("gent", buien.Place("", 51.0, 3.0), False)
+        line = buien.map_lines(frame, mask, marks, buien.Paint(False))[3]
+        self.assertEqual(line, " gent ● ● home")
+        marks[0] = buien.Mark("gent", buien.Place("", 51.0, 2.0), False)
+        line = buien.map_lines(frame, mask, marks, buien.Paint(False))[3]
+        self.assertEqual(line, "    ●   ● home")
+
+    def test_the_title_says_when_and_what_falls(self):
+        frame = buien.Frame(self.NOW + timedelta(minutes=20), radar_rows(8, 6, {(1, 1): PALE_BLUE}))
+        title = plain(buien.render_map(frame, self.NOW, [], buien.Paint(False))[1])
+        self.assertIn("Radar · " + buien.clock(frame.time) + " · in 20 min", title)
+        self.assertIn("drizzle █", title)
+        dry = buien.Frame(self.NOW - timedelta(minutes=10), radar_rows(8, 6))
+        title = plain(buien.render_map(dry, self.NOW, [], buien.Paint(False))[1])
+        self.assertIn("10 min ago", title)
+        self.assertIn("no rain on the radar", title)
 
 
 class SearchTest(unittest.TestCase):
@@ -942,6 +1276,45 @@ class CommandTest(unittest.TestCase):
         self.assertEqual(trip["earliest"], START.replace(minute=40).isoformat(timespec="minutes"))
         self.assertEqual(trip["latest"], START.replace(minute=50).isoformat(timespec="minutes"))
         self.assertEqual(trip["summary"], "leave between 12:40 and 12:50 to stay dry for 25 min")
+
+    def test_plain_buien_in_a_terminal_is_live_and_text_otherwise(self):
+        def live(*argv, terminal=True):
+            with mock.patch.object(buien.sys.stdin, "isatty", return_value=terminal), \
+                    mock.patch.object(buien.sys.stdout, "isatty", return_value=terminal):
+                return buien.wants_live(buien.parse_args(list(argv)))
+
+        self.assertTrue(live())
+        self.assertTrue(live("gent"))
+        self.assertFalse(live(terminal=False))
+        for flag in ("--once", "--short", "--json"):
+            self.assertFalse(live(flag))
+        self.assertTrue(live("--live", terminal=False))
+        with mock.patch.object(buien, "termios", None):
+            self.assertFalse(live())
+
+    def run_once(self, radar):
+        out, err = io.StringIO(), io.StringIO()
+        out.isatty = lambda: True
+        with mock.patch.object(buien, "lookup", return_value=GENT), \
+                mock.patch.object(buien, "fetch_forecast", return_value=slots(0, 1, 0)), \
+                mock.patch.object(buien, "fetch_radar", **radar), \
+                mock.patch.object(buien, "load_places", return_value={}), \
+                mock.patch.object(buien.shutil, "get_terminal_size", return_value=os.terminal_size((100, 40))), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = buien.main(["gent", "--once"])
+        return code, plain(out.getvalue()), err.getvalue()
+
+    def test_once_in_a_terminal_draws_the_map_above_the_chart(self):
+        frame = buien.Frame(START, radar_rows(8, 6))
+        code, out, _ = self.run_once({"return_value": [frame]})
+        self.assertEqual(code, 0)
+        self.assertLess(out.index("Radar · 12:30"), out.index("Gent · "))
+
+    def test_once_without_a_radar_still_draws_the_chart(self):
+        code, out, err = self.run_once({"side_effect": buien.BuienError("Buienradar has no radar map right now")})
+        self.assertEqual(code, 0)
+        self.assertIn("buien: no radar map (Buienradar has no radar map right now)", err)
+        self.assertIn("dry until 12:35, then 5 min of light rain", out)
 
     def test_color_follows_the_flags_then_the_environment_then_the_terminal(self):
         def color(*argv, env=None, terminal=False):

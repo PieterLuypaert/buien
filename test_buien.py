@@ -10,7 +10,7 @@ import sys
 import tempfile
 import unittest
 import urllib.error
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -18,6 +18,19 @@ _loader = importlib.machinery.SourceFileLoader("buien", os.path.join(HERE, "buie
 buien = importlib.util.module_from_spec(importlib.util.spec_from_loader("buien", _loader))
 sys.modules["buien"] = buien
 _loader.exec_module(buien)
+
+_module_patches = contextlib.ExitStack()
+
+
+def setUpModule():
+    """Keeps every test away from the real cache in ~/.cache."""
+    cache = _module_patches.enter_context(tempfile.TemporaryDirectory())
+    _module_patches.enter_context(mock.patch.dict(os.environ, {"XDG_CACHE_HOME": cache}))
+
+
+def tearDownModule():
+    _module_patches.close()
+
 
 START = datetime(2026, 10, 13, 12, 30).astimezone()
 GENT = buien.Place("Gent", 51.05, 3.72)
@@ -129,25 +142,27 @@ class ChartTest(unittest.TestCase):
         self.assertNotIn("\033[", self.render(forecast, color=False))
 
 
-class ForecastTest(unittest.TestCase):
-    def data(self, *mm):
-        return {
-            "forecasts": [
-                {"utcdatetime": f"2026-10-13T10:{30 + 5 * index}:00", "precipitation": value}
-                for index, value in enumerate(mm)
-            ]
-        }
+def radar_answer(*mm):
+    """Buienradar's answer with a slot every five minutes from 10:30 UTC."""
+    return {
+        "forecasts": [
+            {"utcdatetime": f"2026-10-13T10:{30 + 5 * index}:00", "precipitation": value}
+            for index, value in enumerate(mm)
+        ]
+    }
 
+
+class ForecastTest(unittest.TestCase):
     def test_starts_at_the_slot_that_is_running(self):
         now = datetime(2026, 10, 13, 10, 37, tzinfo=timezone.utc)
-        forecast = buien.parse_forecast(self.data(0, 0.5, 1.5, 0), now)
+        forecast = buien.parse_forecast(radar_answer(0, 0.5, 1.5, 0), now)
         self.assertEqual(forecast[0].time, datetime(2026, 10, 13, 10, 35, tzinfo=timezone.utc))
         self.assertEqual([slot.mm for slot in forecast], [0.5, 1.5, 0])
 
     def test_stale_forecast(self):
         now = datetime(2026, 10, 13, 12, 0, tzinfo=timezone.utc)
         with self.assertRaisesRegex(buien.BuienError, "out of date"):
-            buien.parse_forecast(self.data(0, 0), now)
+            buien.parse_forecast(radar_answer(0, 0), now)
 
     def test_unexpected_answer(self):
         with self.assertRaisesRegex(buien.BuienError, "unexpected"):
@@ -158,11 +173,102 @@ class ForecastTest(unittest.TestCase):
             with self.assertRaisesRegex(buien.BuienError, "no radar for Madrid"):
                 buien.fetch_forecast(buien.Place("Madrid", 40.4, -3.7), START)
 
+    def test_a_connection_that_drops_halfway(self):
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.side_effect = buien.http.client.IncompleteRead(b"{")
+        with mock.patch.object(buien.urllib.request, "urlopen", return_value=response):
+            with self.assertRaisesRegex(buien.BuienError, "no usable answer from graphdata.buienradar.nl"):
+                buien.fetch_json("https://graphdata.buienradar.nl/x")
+
     def test_unreachable(self):
         error = urllib.error.URLError("no route")
         with mock.patch.object(buien.urllib.request, "urlopen", side_effect=error):
             with self.assertRaisesRegex(buien.BuienError, "unreachable"):
                 buien.fetch_json("https://graphdata.buienradar.nl/x")
+
+
+class CacheTest(unittest.TestCase):
+    NOW = datetime(2026, 10, 13, 10, 32, tzinfo=timezone.utc)
+    UNREACHABLE = buien.BuienError("graphdata.buienradar.nl is unreachable (no route)")
+
+    def setUp(self):
+        cache = tempfile.TemporaryDirectory()
+        self.addCleanup(cache.cleanup)
+        mock.patch.dict(os.environ, {"XDG_CACHE_HOME": cache.name}).start()
+        self.fetch_json = mock.patch.object(buien, "fetch_json", return_value=radar_answer(0, 0, 0, 1, 0)).start()
+        self.addCleanup(mock.patch.stopall)
+
+    def fetch(self, minutes_later=0):
+        return buien.fetch_forecast(GENT, self.NOW + timedelta(minutes=minutes_later))
+
+    def test_a_fresh_forecast_is_reused(self):
+        self.fetch()
+        self.fetch(4)
+        self.assertEqual(self.fetch_json.call_count, 1)
+
+    def test_an_older_one_is_fetched_again(self):
+        self.fetch()
+        self.fetch(5)
+        self.assertEqual(self.fetch_json.call_count, 2)
+
+    def test_offline_shows_the_last_forecast(self):
+        self.fetch()
+        self.fetch_json.side_effect = self.UNREACHABLE
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            forecast = self.fetch(10)
+        self.assertEqual([slot.mm for slot in forecast], [0, 1, 0])
+        self.assertIn(f"unreachable (no route), showing the forecast from {buien.clock(self.NOW.astimezone())}", err.getvalue())
+
+    def test_offline_without_a_forecast(self):
+        self.fetch_json.side_effect = self.UNREACHABLE
+        with self.assertRaisesRegex(buien.BuienError, "unreachable"):
+            self.fetch()
+
+    def test_offline_when_the_last_forecast_is_over(self):
+        self.fetch()
+        self.fetch_json.side_effect = self.UNREACHABLE
+        with self.assertRaisesRegex(buien.BuienError, "unreachable"):
+            self.fetch(60)
+
+    def test_an_unreadable_cache_is_fetched_again(self):
+        path = buien.cache_file(GENT)
+        path.parent.mkdir(parents=True)
+        path.write_text("{not json")
+        self.assertEqual([slot.mm for slot in self.fetch()], [0, 0, 0, 1, 0])
+        self.assertEqual(self.fetch_json.call_count, 1)
+
+    def test_a_broken_answer_keeps_the_last_good_forecast(self):
+        self.fetch()
+        self.fetch_json.return_value = {"forecasts": [{"precipitation": 1}]}
+        with self.assertRaisesRegex(buien.BuienError, "unexpected answer"):
+            self.fetch(5)
+        self.fetch_json.side_effect = self.UNREACHABLE
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual([slot.mm for slot in self.fetch(6)], [0, 0, 1, 0])
+
+    def test_a_cache_without_a_time_zone_counts_as_none(self):
+        path = buien.cache_file(GENT)
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({"fetched": "2026-10-13T10:31:00", "data": radar_answer(0)}))
+        self.fetch()
+        self.assertEqual(self.fetch_json.call_count, 1)
+
+    def test_forecasts_past_three_hours_old_are_removed(self):
+        old = buien.cache_file(buien.Place("Brussel", 50.85, 4.35))
+        old.parent.mkdir(parents=True)
+        old.write_text("{}")
+        hours_ago = (self.NOW - timedelta(hours=4)).timestamp()
+        os.utime(old, (hours_ago, hours_ago))
+        self.fetch()
+        self.assertFalse(old.exists())
+        self.assertTrue(buien.cache_file(GENT).exists())
+
+    def test_no_radar_is_not_cached(self):
+        self.fetch_json.return_value = None
+        with self.assertRaisesRegex(buien.BuienError, "no radar"):
+            self.fetch()
+        self.assertFalse(buien.cache_file(GENT).exists())
 
 
 class LookupTest(unittest.TestCase):

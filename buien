@@ -20,10 +20,14 @@
   buien --version     the version of buien
 
 Saved places, home among them, are kept in ~/.config/buien/places.json.
+A forecast is reused for five minutes from ~/.cache/buien, and shown from
+there when Buienradar cannot be reached.
 Works in the Netherlands, Belgium and the border regions, as far as
 Buienradar's radar reaches. Colour is dropped with NO_COLOR or when the
 output is not a terminal.
 """
+import contextlib
+import http.client
 import json
 import math
 import os
@@ -46,6 +50,8 @@ FORECAST_URL = "https://graphdata.buienradar.nl/2.0/forecast/geo/Rain3Hour?lat={
 GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search?"
 NEARBY_COUNTRIES = ("BE", "NL")
 STEP = timedelta(minutes=5)
+CACHE_FRESH = timedelta(minutes=5)
+CACHE_KEEP = timedelta(hours=3)
 SHORT_GAP = 1
 ROWS = 3
 BLOCKS = " ▁▂▃▄▅▆▇█"
@@ -56,6 +62,7 @@ HOME = "home"
 Place = namedtuple("Place", "name lat lon")
 Slot = namedtuple("Slot", "time mm")
 Kind = namedtuple("Kind", "limit name label adjective color")
+Cached = namedtuple("Cached", "fetched slots")
 
 KINDS = [
     Kind(0.5, "drizzle", "drizzle", "light", 110),
@@ -97,8 +104,8 @@ def fetch_json(url):
         raise BuienError(f"{host} answered with HTTP {error.code}") from error
     except urllib.error.URLError as error:
         raise BuienError(f"{host} is unreachable ({error.reason})") from error
-    except (OSError, ValueError) as error:
-        raise BuienError(f"no usable answer from {host} ({error})") from error
+    except (OSError, ValueError, http.client.HTTPException) as error:
+        raise BuienError(f"no usable answer from {host} ({error!r})") from error
 
 
 def lookup(text, choose=False):
@@ -159,9 +166,13 @@ def search_places(name):
     return (fetch_json(GEOCODE_URL + query) or {}).get("results") or []
 
 
+def user_dir(variable, default):
+    """buien's own folder under an XDG base folder such as XDG_CONFIG_HOME."""
+    return Path(os.environ.get(variable) or Path.home() / default) / "buien"
+
+
 def places_file():
-    config = os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config"
-    return Path(config) / "buien" / "places.json"
+    return user_dir("XDG_CONFIG_HOME", ".config") / "places.json"
 
 
 def load_places():
@@ -267,22 +278,86 @@ def save_target(options):
 
 
 def fetch_forecast(place, now):
-    data = fetch_json(FORECAST_URL.format(lat=place.lat, lon=place.lon))
+    """From the cache while it is fresh, else from Buienradar, and from the cache again when Buienradar is unreachable."""
+    cached = read_cache(place)
+    if cached and timedelta(0) <= now - cached.fetched < CACHE_FRESH:
+        ahead = slots_ahead(cached.slots, now)
+        if ahead:
+            return ahead
+    try:
+        data = fetch_json(FORECAST_URL.format(lat=place.lat, lon=place.lon))
+    except BuienError as error:
+        return fall_back(cached, now, error)
     if data is None:
         raise BuienError(f"Buienradar has no radar for {place.name}, only for the Netherlands, Belgium and the border regions")
-    return parse_forecast(data, now)
+    slots = parse_forecast(data, now)
+    write_cache(place, now, data)
+    return slots
+
+
+def fall_back(cached, now, error):
+    """The cached forecast when Buienradar cannot be reached, as long as some of it lies ahead."""
+    ahead = slots_ahead(cached.slots, now) if cached else []
+    if not ahead:
+        raise error
+    print(f"buien: {error}, showing the forecast from {clock(cached.fetched.astimezone())}", file=sys.stderr)
+    return ahead
+
+
+def cache_file(place):
+    return user_dir("XDG_CACHE_HOME", ".cache") / f"{place.lat:.2f},{place.lon:.2f}.json"
+
+
+def read_cache(place):
+    """The last forecast fetched for this place; an unreadable cache counts as none and the next fetch rewrites it."""
+    path = cache_file(place)
+    if not path.exists():
+        return None
+    try:
+        cached = json.loads(path.read_text(encoding="utf-8"))
+        fetched = datetime.fromisoformat(cached["fetched"])
+        if fetched.tzinfo is None:
+            return None
+        return Cached(fetched, parse_slots(cached["data"]))
+    except (OSError, ValueError, KeyError, TypeError, BuienError):
+        return None
+
+
+def write_cache(place, now, data):
+    path = cache_file(place)
+    try:
+        write_atomic(path, json.dumps({"fetched": now.isoformat(), "data": data}))
+        prune_cache(path.parent, now)
+    except OSError as error:
+        print(f"buien: could not cache the forecast ({error})", file=sys.stderr)
+
+
+def prune_cache(folder, now):
+    """Removes cached forecasts that no longer reach past now."""
+    oldest = (now - CACHE_KEEP).timestamp()
+    for path in folder.glob("*.json"):
+        with contextlib.suppress(FileNotFoundError):  # another buien may be pruning too
+            if path.stat().st_mtime < oldest:
+                path.unlink()
 
 
 def parse_forecast(data, now):
     """The 5-minute slots from the one running at now on, in local time."""
+    ahead = slots_ahead(parse_slots(data), now)
+    if not ahead:
+        raise BuienError("Buienradar's forecast is out of date, try again in a moment")
+    return ahead
+
+
+def parse_slots(data):
     try:
-        slots = [Slot(utc_to_local(f["utcdatetime"]), float(f["precipitation"])) for f in data["forecasts"]]
+        return [Slot(utc_to_local(f["utcdatetime"]), float(f["precipitation"])) for f in data["forecasts"]]
     except (KeyError, TypeError, ValueError) as error:
         raise BuienError(f"Buienradar sent an unexpected answer ({error!r})") from error
-    upcoming = [slot for slot in slots if slot.time + STEP > now]
-    if not upcoming:
-        raise BuienError("Buienradar's forecast is out of date, try again in a moment")
-    return upcoming
+
+
+def slots_ahead(slots, now):
+    return [slot for slot in slots if slot.time + STEP > now]
 
 
 def utc_to_local(text):

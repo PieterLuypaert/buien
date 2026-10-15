@@ -420,6 +420,19 @@ class CommandTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("buien gent", out)
 
+    def test_version(self):
+        code, out, _ = run_main("--version")
+        self.assertEqual(code, 0)
+        self.assertEqual(out, f"buien {buien.__version__}\n")
+
+    def test_requests_name_buien_and_its_version(self):
+        response = mock.MagicMock()
+        response.__enter__.return_value = io.BytesIO(b"{}")
+        with mock.patch.object(buien.urllib.request, "urlopen", return_value=response) as urlopen:
+            buien.fetch_json("https://graphdata.buienradar.nl/x")
+        agent = urlopen.call_args.args[0].get_header("User-agent")
+        self.assertEqual(agent, f"buien/{buien.__version__} (+https://github.com/PieterLuypaert/buien)")
+
     def run_with_forecast(self, *argv):
         with mock.patch.object(buien, "lookup", return_value=GENT), \
                 mock.patch.object(buien, "fetch_forecast", return_value=slots(0, 1.5, 0)):

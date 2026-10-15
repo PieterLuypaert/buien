@@ -1,6 +1,6 @@
 # buien
 
-Should I cycle now? `buien` shows the rain for the next three hours as a small chart in your terminal, with a summary such as "dry until 14:20, then 15 min of light rain". The data comes from Buienradar, so it works in the Netherlands, Belgium and the border regions.
+Should I cycle now? `buien` fills your terminal with Buienradar's rain radar, playing the next two hours over a map of the Low Countries with your places on it. Below the map is a chart of the rain at your place for the next three hours, with a summary such as "dry until 14:20, then 15 min of light rain". It works in the Netherlands, Belgium and the border regions.
 
 ## Install
 
@@ -21,7 +21,7 @@ curl -fsSL https://raw.githubusercontent.com/PieterLuypaert/buien/main/buien -o 
 chmod +x ~/.local/bin/buien
 ```
 
-Run `buien`, or `buien -h` for every option.
+Run `buien`, or `buien -h` for every option. The first time, buien asks where home is.
 
 ## When to leave
 
@@ -31,20 +31,25 @@ Run `buien`, or `buien -h` for every option.
 buien --trip 20 --short >/dev/null && echo "go now" || echo "wait a bit"
 ```
 
-## Live view
+## The live screen
 
-`buien --live` fills the terminal with the chart and keeps it up to date, with a tab for every saved place:
+Plain `buien`, or `buien gent` for somewhere else, opens the live screen with a tab for every saved place. The map plays the radar's next two hours, and the cursor in the chart moves along with it. On a wide terminal the map sits beside the chart, otherwise above it. Everything refreshes by itself: the forecast every minute, the radar every five.
 
 | Key | Does |
 | --- | --- |
-| ← → | move through the hours; the line under the chart gives the rain at that moment |
+| ← → or the scroll wheel | pause and move through the hours; the map shows that moment, and the line under the chart gives the rain then |
+| space | play the map again |
 | ↑ ↓ or tab | the previous or next place |
 | / | search a place, which opens in a tab of its own |
 | s | save the place on screen under a name |
-| r | fetch the forecast again, past the cache |
+| r | fetch the forecast and the radar again, past the cache |
 | q or esc | quit |
 
-With `--trip 25` it also says when to leave, for whichever place is on screen.
+With `--trip 25` it also says when to leave, for whichever place is on screen. In a short terminal the map makes way for the chart. buien takes the scroll wheel, so to select text, hold the modifier your terminal uses for that, such as Option or Shift.
+
+The map is Buienradar's own radar over a map of the area it covers. The radar of now lags the clock by about ten minutes, which the title says, and the frames after it are Buienradar's forecast. The kinds of rain on the map follow Buienradar's colours roughly; the chart has the exact amounts for your place.
+
+`buien --once` prints the map of now and the chart once and gives you the prompt back. Piped into another command, buien prints the chart as plain text.
 
 ## Tab completion
 

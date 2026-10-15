@@ -575,6 +575,22 @@ class CommandTest(unittest.TestCase):
         self.assertEqual([slot["mm_per_hour"] for slot in data["forecast"]], [0, 1.5, 0])
         self.assertEqual(data["forecast"][1]["time"], START.replace(minute=35).isoformat(timespec="minutes"))
 
+    def test_color_follows_the_flags_then_the_environment_then_the_terminal(self):
+        def color(*argv, env=None, terminal=False):
+            with mock.patch.dict(os.environ, env or {}), \
+                    mock.patch.object(buien.sys.stdout, "isatty", return_value=terminal):
+                return buien.use_color(buien.parse_args(list(argv)))
+
+        with mock.patch.dict(os.environ):
+            os.environ.pop("NO_COLOR", None)
+            os.environ.pop("FORCE_COLOR", None)
+            self.assertTrue(color(terminal=True))
+            self.assertFalse(color())
+            self.assertFalse(color(env={"NO_COLOR": "1"}, terminal=True))
+            self.assertTrue(color(env={"FORCE_COLOR": "1"}))
+            self.assertTrue(color("--color", env={"NO_COLOR": "1"}))
+            self.assertFalse(color("--no-color", terminal=True))
+
     def test_shows_the_chart(self):
         with mock.patch.object(buien, "lookup", return_value=GENT), \
                 mock.patch.object(buien, "fetch_forecast", return_value=slots(0, 1, 0)):

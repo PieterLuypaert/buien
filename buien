@@ -17,6 +17,8 @@
   buien --forget work forget a saved place
   buien --short       only the summary, for a status bar or prompt
   buien --json        the forecast as JSON, for scripts
+  buien --color       colour even when the output is not a terminal, such as
+                      in watch -c buien --color; --no-color for none at all
   buien --version     the version of buien
 
 Saved places, home among them, are kept in ~/.config/buien/places.json.
@@ -24,7 +26,7 @@ A forecast is reused for five minutes from ~/.cache/buien, and shown from
 there when Buienradar cannot be reached.
 Works in the Netherlands, Belgium and the border regions, as far as
 Buienradar's radar reaches. Colour is dropped with NO_COLOR or when the
-output is not a terminal.
+output is not a terminal, and kept with FORCE_COLOR.
 """
 import contextlib
 import http.client
@@ -40,6 +42,7 @@ import urllib.parse
 import urllib.request
 from collections import namedtuple
 from dataclasses import dataclass, field
+from typing import Optional
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -87,6 +90,7 @@ class Options:
     list_places: bool = False
     short: bool = False
     as_json: bool = False
+    color: Optional[bool] = None
     help: bool = False
     version: bool = False
 
@@ -526,8 +530,13 @@ def to_json(place, slots):
     }
 
 
-def use_color():
-    return sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+def use_color(options):
+    """--color or --no-color first, then NO_COLOR, then FORCE_COLOR, else only in a terminal."""
+    if options.color is not None:
+        return options.color
+    if os.environ.get("NO_COLOR"):
+        return False
+    return bool(os.environ.get("FORCE_COLOR")) or sys.stdout.isatty()
 
 
 def parse_args(argv):
@@ -551,6 +560,8 @@ def parse_args(argv):
             options.short = True
         elif arg == "--json":
             options.as_json = True
+        elif arg in ("--color", "--no-color"):
+            options.color = arg == "--color"
         elif arg.startswith("-") and not COORDS.match(arg):
             raise BuienError(f"unknown option {arg}, see buien -h")
         else:
@@ -583,7 +594,7 @@ def run(options):
     elif options.short:
         print(summarize(slots))
     else:
-        print(render(place, slots, now, use_color(), shutil.get_terminal_size().columns))
+        print(render(place, slots, now, use_color(options), shutil.get_terminal_size().columns))
     return 0
 
 

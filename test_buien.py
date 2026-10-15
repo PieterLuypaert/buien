@@ -113,6 +113,15 @@ class ChartTest(unittest.TestCase):
         self.assertFalse(set(text) & set(buien.BLOCKS.strip()))
         self.assertIn("dry until at least 14:30", text)
 
+    def test_a_dry_chart_says_so_in_its_middle_row(self):
+        rows = buien.chart_rows(slots(*[0] * 24), 2, buien.Paint(False))
+        self.assertEqual(rows[0], "")
+        self.assertEqual(rows[1].strip(), "no rain in sight")
+        self.assertEqual(len(rows[1]) - len(rows[1].lstrip()), (48 - len("no rain in sight")) // 2)
+
+    def test_a_dry_chart_too_narrow_for_the_words_stays_empty(self):
+        self.assertEqual(buien.chart_rows(slots(0, 0, 0), 2, buien.Paint(False)), ["", "", ""])
+
     def test_a_shower_draws_bars_in_its_own_columns(self):
         rows = buien.chart_rows(slots(0, 0, 10, 0), 2, buien.Paint(False))
         self.assertEqual([row.rstrip() for row in rows], ["    ██", "    ██", "    ██"])

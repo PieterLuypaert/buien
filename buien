@@ -499,6 +499,9 @@ def chart_rows(slots, cell, paint):
             fill = min(8, max(0, level - row * 8))
             cells.append(paint.color(BLOCKS[fill] * cell, kind_of(slot.mm).color) if fill else " " * cell)
         rows.append("".join(cells).rstrip())
+    dry = "no rain in sight"
+    if not any(levels) and len(dry) <= len(slots) * cell:
+        rows[ROWS // 2] = paint.dim(dry.center(len(slots) * cell).rstrip())
     return rows
 
 

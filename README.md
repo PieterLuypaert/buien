@@ -40,6 +40,8 @@ Plain `buien`, or `buien gent` for somewhere else, opens the live screen with a 
 | ← → or the scroll wheel | pause and move through the hours; the map shows that moment, and the line under the chart gives the rain then |
 | space | play the map again |
 | ↑ ↓ or tab | the previous or next place |
+| + and - | zoom the map in and out around the place on screen, up to four times |
+| h j k l, or drag with the mouse | move the zoomed map; c brings it back to the place |
 | / | search a place, which opens in a tab of its own |
 | s | save the place on screen under a name |
 | r | fetch the forecast and the radar again, past the cache |
@@ -47,7 +49,7 @@ Plain `buien`, or `buien gent` for somewhere else, opens the live screen with a 
 
 With `--trip 25` it also says when to leave, for whichever place is on screen. In a short terminal the map makes way for the chart. buien takes the scroll wheel, so to select text, hold the modifier your terminal uses for that, such as Option or Shift.
 
-The map is Buienradar's own radar over a map of the area it covers. The radar of now lags the clock by about ten minutes, which the title says, and the frames after it are Buienradar's forecast. The kinds of rain on the map follow Buienradar's colours roughly; the chart has the exact amounts for your place.
+Zoomed in, buien asks Buienradar for the radar that much bigger, so the rain stays as sharp as Buienradar has it rather than growing into blocks. The map is Buienradar's own radar over a map of the area it covers. The radar of now lags the clock by about ten minutes, which the title says, and the frames after it are Buienradar's forecast. The kinds of rain on the map follow Buienradar's colours roughly; the chart has the exact amounts for your place.
 
 `buien --once` prints the map of now and the chart once and gives you the prompt back. Piped into another command, buien prints the chart as plain text.
 

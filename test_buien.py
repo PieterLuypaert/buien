@@ -612,16 +612,21 @@ class LiveTest(LiveCase):
 
     def test_the_mouse_wheel_moves_through_the_hours_and_clicks_do_nothing(self):
         keys = buien.parse_keys("\033[<65;10;5M\033[<65;10;5M\033[<64;10;5M\033[<0;3;4M\033[<0;3;4m")
-        self.assertEqual(keys, ["wheel-down", "wheel-down", "wheel-up", "mouse", "mouse"])
+        self.assertEqual(keys, ["wheel-down", "wheel-down", "wheel-up", "press 3 4", "release"])
         self.assertEqual(self.press(*keys), [True] * 5)
         self.assertEqual(self.live.cursor, 1)
         self.assertFalse(self.live.playing)
+
+    def test_a_release_in_the_older_mouse_format(self):
+        with mock.patch.object(buien.os, "read", return_value=b"\033[M#!!"), \
+                mock.patch.object(buien.select, "select", return_value=([], [], [])):
+            self.assertEqual(buien.read_keys(0), ["release"])
 
     def test_the_older_mouse_format_never_reads_as_keys(self):
         events = b"\033[Ma!!\033[M`\xf0!\033[M qqq"
         with mock.patch.object(buien.os, "read", return_value=events), \
                 mock.patch.object(buien.select, "select", return_value=([], [], [])):
-            self.assertEqual(buien.read_keys(0), ["wheel-down", "wheel-up", "mouse", "q"])
+            self.assertEqual(buien.read_keys(0), ["wheel-down", "wheel-up", "press 81 81", "q"])
 
     def test_a_wheel_event_cut_in_two_by_a_read_is_completed(self):
         with mock.patch.object(buien.os, "read", side_effect=[b"\033[<65;1", b"0;5M"]), \
@@ -865,6 +870,168 @@ class LiveMapTest(LiveCase):
         self.assertIn("leave from 12:50 to stay dry for 25 min", "\n".join(lines))
 
 
+BUGGENHOUT = buien.Place("Buggenhout", 51.0159, 4.20173)
+
+
+class LiveZoomTest(LiveCase):
+    TALL = os.terminal_size((100, 40))
+
+    def setUp(self):
+        super().setUp()
+        self.fetch_radar = mock.Mock(side_effect=self.radar_with_rain_at_home)
+        self.live = buien.Live([buien.Tab("home", BUGGENHOUT), buien.Tab("work", BRUSSEL)], fetch=self.fetch,
+                               radar=buien.Radar(fetch=self.fetch_radar))
+        self.load()
+
+    @staticmethod
+    def radar_with_rain_at_home(width, height):
+        """The whole map at width x height, dry but for a block of heavy rain centred on Buggenhout."""
+        x, y = buien.map_position(BUGGENHOUT, width, height)
+        rain = {(x + dx, y + dy): DEEP_BLUE for dx in range(-3, 4) for dy in range(-3, 4)}
+        return [buien.Frame(START, radar_rows(width, height, rain))]
+
+    def load(self, later=0):
+        while self.live.update(self.NOW + timedelta(seconds=later), self.TALL):
+            pass
+
+    def view(self):
+        return self.live.view(self.live.radar.window, self.live.radar.zoom)
+
+    def lines(self):
+        return [plain(line) for line in self.live.screen(self.NOW, 100, 40, False)]
+
+    def home_line(self):
+        return next(line for line in self.lines() if "● home" in line)
+
+    def test_zooming_in_loads_the_map_twice_as_big_around_the_place(self):
+        width, height = self.fetch_radar.call_args.args
+        self.press("+")
+        self.load()
+        self.assertEqual(self.fetch_radar.call_args.args, (width * 2, height * 2))
+        self.assertIn("· 2x", "\n".join(self.lines()))
+        view = self.view()
+        x, y = buien.view_position(BUGGENHOUT, view)
+        self.assertLessEqual(abs(x - view.width // 2), 1)
+        self.assertLessEqual(abs(y - view.height // 2), 1)
+
+    def test_rain_and_map_stay_under_the_place_at_every_zoom(self):
+        for zoom in (1, 2, 4):
+            with self.subTest(zoom=zoom):
+                line = self.home_line()
+                dot = line.index("● home")
+                self.assertEqual(line[dot - 1], "▓")
+                x, y = buien.view_position(BUGGENHOUT, self.view())
+                window = buien.map_mask(self.view().width * zoom, self.view().height * zoom,
+                                        (self.view().left, self.view().top, self.view().width, self.view().height))
+                self.assertEqual(window[y][x], buien.LAND_LIGHT)
+                self.press("+")
+                self.load()
+
+    def test_zoom_stops_at_four_times_and_goes_back_to_the_whole_map(self):
+        self.press("+", "+", "+", "+")
+        self.assertEqual(self.live.zoom, 4)
+        self.press("l")
+        self.press("-", "-", "-")
+        self.assertEqual((self.live.zoom, self.live.center), (1, None))
+
+    def test_moving_the_zoomed_map_and_back_to_the_place(self):
+        self.press("+")
+        self.load()
+        before = self.view()
+        self.press("l", "k")
+        moved = self.view()
+        self.assertEqual(moved.left - before.left, before.width // 4)
+        self.assertEqual(before.top - moved.top, before.height // 4)
+        self.press("c")
+        self.assertEqual(self.view(), before)
+
+    def test_moving_stops_at_the_edge_of_the_map(self):
+        self.press("+")
+        self.load()
+        self.press(*["h"] * 20, *["k"] * 20)
+        self.assertEqual(self.view()[1:3], (0, 0))
+        self.press("l")
+        self.assertGreater(self.view().left, 0)
+
+    def test_dragging_moves_the_map_along_under_the_pointer(self):
+        self.press("+")
+        self.load()
+        self.lines()
+        before = self.view()
+        self.press("press 30 10", "drag 26 9", "release", "drag 10 10")
+        moved = self.view()
+        self.assertEqual((moved.left - before.left, moved.top - before.top), (4, 2))
+
+    def test_a_drag_that_starts_off_the_map_does_not_move_it(self):
+        self.press("+")
+        self.load()
+        self.lines()
+        before = self.view()
+        self.press("press 30 35", "drag 20 35", "press 1 1", "drag 5 5")
+        self.assertEqual(self.view(), before)
+
+    def test_a_release_ends_a_drag_even_in_a_prompt(self):
+        self.press("+")
+        self.load()
+        self.lines()
+        self.press("press 30 10", "/", "release", "esc")
+        self.assertIsNone(self.live.dragging)
+
+    def test_a_place_opened_by_search_comes_into_view(self):
+        self.live.search = mock.Mock(return_value=[buien.Place("Oostende", 51.23, 2.92)])
+        self.press("+")
+        self.load()
+        self.press("l", "l", "l", "/", *"oostende", "enter")
+        self.load()
+        self.assertIsNone(self.live.center)
+        self.assertIsNotNone(buien.view_position(self.live.tab.place, self.view()))
+
+    def test_another_zoom_loads_at_once_after_a_failed_refresh(self):
+        self.fetch_radar.side_effect = buien.BuienError("graphdata is unreachable")
+        self.live.radar.reload()
+        self.load()
+        self.fetch_radar.side_effect = self.radar_with_rain_at_home
+        self.press("+")
+        self.load()
+        self.assertEqual(self.live.radar.zoom, 2)
+
+    def test_a_failed_load_at_a_new_size_drops_the_old_frames(self):
+        self.fetch_radar.side_effect = buien.BuienError("graphdata is unreachable")
+        self.live.update(self.NOW, os.terminal_size((110, 44)))
+        self.live.update(self.NOW + timedelta(seconds=2), os.terminal_size((110, 44)))
+        self.assertIsInstance(self.live.radar.frames, buien.BuienError)
+
+    def test_zoomed_in_a_dry_window_says_no_rain_in_view(self):
+        self.fetch_radar.side_effect = lambda width, height: [buien.Frame(START, radar_rows(width, height))]
+        self.press("+")
+        self.load()
+        self.assertIn("no rain in view", "\n".join(self.lines()))
+
+    def test_four_times_the_widest_map_is_as_far_as_buienradar_goes(self):
+        self.assertLessEqual(buien.MAP_MAX_WIDTH * buien.MAX_ZOOM, buien.RADAR_SIZE[0])
+
+    def test_the_whole_map_does_not_move(self):
+        before = self.view()
+        self.press("l", "press 30 10", "drag 20 10")
+        self.assertEqual(self.view(), before)
+
+    def test_another_place_brings_the_map_to_it(self):
+        self.press("+", "l", "l")
+        self.load()
+        self.press("down")
+        self.load()
+        self.assertIsNone(self.live.center)
+        x, y = buien.view_position(BRUSSEL, self.view())
+        self.assertLessEqual(abs(x - self.view().width // 2), 1)
+
+    def test_a_view_shows_only_its_window(self):
+        frame = buien.Frame(START, radar_rows(20, 10, {(12, 6): RED}))
+        window = buien.crop(frame, buien.View(2, 10, 5, 10, 5))
+        self.assertEqual((len(window.rows[0]) // 4, len(window.rows)), (10, 5))
+        self.assertEqual(bytes(window.rows[1][8:12]), bytes(RED))
+        self.assertIsNone(buien.view_position(BUGGENHOUT, buien.View(2, 0, 0, 5, 5)))
+
+
 class LiveSearchTest(LiveCase):
     def test_search_opens_a_single_match_right_away(self):
         self.live.search = mock.Mock(return_value=[MONS])
@@ -1003,7 +1170,7 @@ class MapTest(unittest.TestCase):
             "Buggenhout": (buien.Place("Buggenhout", 51.016, 4.202), buien.LAND_LIGHT),
             "Utrecht": (buien.Place("Utrecht", 52.09, 5.12), buien.LAND_DARK),
             "Sauerland": (buien.Place("Sauerland", 51.2, 8.0), buien.LAND_LIGHT),
-            "Lille": (buien.Place("Lille", 50.63, 3.06), buien.LAND_DARK),
+            "Arras": (buien.Place("Arras", 50.29, 2.78), buien.LAND_DARK),
             "North Sea": (buien.Place("North Sea", 53.0, 3.0), buien.SEA),
         }
         for name, (place, land) in places.items():
@@ -1107,13 +1274,21 @@ class RadarTest(unittest.TestCase):
         line = buien.map_lines(frame, mask, marks, buien.Paint(False))[3]
         self.assertEqual(line, "    ●   ● home")
 
+    def test_a_legend_too_wide_for_the_map_gets_a_line_of_its_own(self):
+        rain = {(x, 1): color for x, color in enumerate([PALE_BLUE, (120, 128, 255, 204), DEEP_BLUE, RED])}
+        frame = buien.Frame(self.NOW, radar_rows(30, 6, rain))
+        lines = [plain(line) for line in buien.render_map(frame, self.NOW, [], buien.Paint(False))]
+        self.assertTrue(lines[1].strip().startswith("Radar ·"))
+        self.assertTrue(lines[2].strip().startswith("drizzle █"))
+        self.assertEqual(len(lines), 3 + 3)
+
     def test_the_title_says_when_and_what_falls(self):
         frame = buien.Frame(self.NOW + timedelta(minutes=20), radar_rows(8, 6, {(1, 1): PALE_BLUE}))
-        title = plain(buien.render_map(frame, self.NOW, [], buien.Paint(False))[1])
+        title = " ".join(plain(line) for line in buien.render_map(frame, self.NOW, [], buien.Paint(False))[1:3])
         self.assertIn("Radar · " + buien.clock(frame.time) + " · in 20 min", title)
         self.assertIn("drizzle █", title)
         dry = buien.Frame(self.NOW - timedelta(minutes=10), radar_rows(8, 6))
-        title = plain(buien.render_map(dry, self.NOW, [], buien.Paint(False))[1])
+        title = " ".join(plain(line) for line in buien.render_map(dry, self.NOW, [], buien.Paint(False))[1:3])
         self.assertIn("10 min ago", title)
         self.assertIn("no rain on the radar", title)
 

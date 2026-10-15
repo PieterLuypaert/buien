@@ -312,6 +312,17 @@ class PlacesTest(unittest.TestCase):
         self.assertIn("Leuven · ", plain(out))
         self.assertEqual(buien.load_places()["home"], buien.Place("Leuven", 51.05, 3.72))
 
+    def test_a_failed_save_keeps_the_places_file_whole(self):
+        run_main("--home", "gent")
+        with open(self.places_file) as places:
+            before = places.read()
+        with mock.patch.object(buien.os, "replace", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                run_main("--save", "work", "brussel")
+        with open(self.places_file) as places:
+            self.assertEqual(places.read(), before)
+        self.assertEqual(os.listdir(os.path.dirname(self.places_file)), ["places.json"])
+
     def test_unreadable_places(self):
         os.makedirs(os.path.dirname(self.places_file))
         with open(self.places_file, "w") as file:

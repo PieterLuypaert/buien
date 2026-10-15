@@ -30,6 +30,7 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -169,17 +170,30 @@ def load_places():
     if not path.exists():
         return {}
     try:
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding="utf-8"))
         return {name: Place(place["name"], float(place["lat"]), float(place["lon"])) for name, place in data.items()}
     except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
         raise BuienError(f"{path} is unreadable ({error!r}), fix it or remove it and save your places again") from error
 
 
 def write_places(places):
-    path = places_file()
-    path.parent.mkdir(parents=True, exist_ok=True)
     data = {name: place._asdict() for name, place in sorted(places.items())}
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+    write_atomic(places_file(), json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+
+
+def write_atomic(path, text):
+    """Writes through a temporary file, so a write that fails halfway leaves the old file whole."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", delete=False)
+    try:
+        with temporary:
+            temporary.write(text)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary.name, path)
+    except BaseException:
+        os.unlink(temporary.name)
+        raise
 
 
 def save_place(name, place):

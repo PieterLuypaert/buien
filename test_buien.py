@@ -1003,7 +1003,7 @@ class MapTest(unittest.TestCase):
             "Buggenhout": (buien.Place("Buggenhout", 51.016, 4.202), buien.LAND_LIGHT),
             "Utrecht": (buien.Place("Utrecht", 52.09, 5.12), buien.LAND_DARK),
             "Sauerland": (buien.Place("Sauerland", 51.2, 8.0), buien.LAND_LIGHT),
-            "Lille": (buien.Place("Lille", 50.63, 3.06), buien.LAND_DARK),
+            "Arras": (buien.Place("Arras", 50.29, 2.78), buien.LAND_DARK),
             "North Sea": (buien.Place("North Sea", 53.0, 3.0), buien.SEA),
         }
         for name, (place, land) in places.items():

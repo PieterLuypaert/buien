@@ -13,34 +13,50 @@
   buien --search bergen
                       list every Bergen and pick one, also with --home or
                       --save to save the one you pick
-  buien --places      list your saved places
+  buien --places      list your saved places, with --short only their names
   buien --forget work forget a saved place
   buien --short       only the summary, for a status bar or prompt
   buien --json        the forecast as JSON, for scripts
+  buien --color       colour even when the output is not a terminal, such as
+                      in watch -c buien --color; --no-color for none at all
+  buien --completions zsh
+                      tab completion for zsh, bash or fish, see the README
+  buien --version     the version of buien
 
 Saved places, home among them, are kept in ~/.config/buien/places.json.
+A forecast is reused for five minutes from ~/.cache/buien, and shown from
+there when Buienradar cannot be reached.
 Works in the Netherlands, Belgium and the border regions, as far as
 Buienradar's radar reaches. Colour is dropped with NO_COLOR or when the
-output is not a terminal.
+output is not a terminal, and kept with FORCE_COLOR.
 """
+import contextlib
+import http.client
 import json
 import math
 import os
 import re
 import shutil
 import sys
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections import namedtuple
 from dataclasses import dataclass, field
+from typing import Optional
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+__version__ = "0.1.0"
+
+REPO_URL = "https://github.com/PieterLuypaert/buien"
 FORECAST_URL = "https://graphdata.buienradar.nl/2.0/forecast/geo/Rain3Hour?lat={lat:.2f}&lon={lon:.2f}"
 GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search?"
 NEARBY_COUNTRIES = ("BE", "NL")
 STEP = timedelta(minutes=5)
+CACHE_FRESH = timedelta(minutes=5)
+CACHE_KEEP = timedelta(hours=3)
 SHORT_GAP = 1
 ROWS = 3
 BLOCKS = " ▁▂▃▄▅▆▇█"
@@ -51,6 +67,8 @@ HOME = "home"
 Place = namedtuple("Place", "name lat lon")
 Slot = namedtuple("Slot", "time mm")
 Kind = namedtuple("Kind", "limit name label adjective color")
+Flag = namedtuple("Flag", "short long about")
+Cached = namedtuple("Cached", "fetched slots")
 
 KINDS = [
     Kind(0.5, "drizzle", "drizzle", "light", 110),
@@ -59,6 +77,22 @@ KINDS = [
     Kind(10, "heavy rain", "heavy", "heavy", 26),
     Kind(math.inf, "very heavy rain", "very heavy", "very heavy", 162),
 ]
+
+FLAGS = [
+    Flag("-h", "--help", "every option"),
+    Flag("", "--version", "the version of buien"),
+    Flag("", "--home", "save a place as home"),
+    Flag("", "--save", "save a place under a name of your own"),
+    Flag("", "--search", "list every match for a place and pick one"),
+    Flag("", "--places", "list your saved places"),
+    Flag("", "--forget", "forget a saved place"),
+    Flag("-s", "--short", "only the summary"),
+    Flag("", "--json", "the forecast as JSON"),
+    Flag("", "--color", "colour even when the output is not a terminal"),
+    Flag("", "--no-color", "no colour at all"),
+    Flag("", "--completions", "tab completion for bash, fish or zsh"),
+]
+SHELLS = ("bash", "fish", "zsh")
 
 
 class BuienError(Exception):
@@ -75,13 +109,16 @@ class Options:
     list_places: bool = False
     short: bool = False
     as_json: bool = False
+    color: Optional[bool] = None
+    completions: Optional[str] = None
     help: bool = False
+    version: bool = False
 
 
 def fetch_json(url):
     """The decoded JSON at url, or None when the server answers 404."""
     host = urllib.parse.urlsplit(url).hostname
-    request = urllib.request.Request(url, headers={"User-Agent": "buien"})
+    request = urllib.request.Request(url, headers={"User-Agent": f"buien/{__version__} (+{REPO_URL})"})
     try:
         with urllib.request.urlopen(request, timeout=10) as response:
             return json.load(response)
@@ -91,8 +128,8 @@ def fetch_json(url):
         raise BuienError(f"{host} answered with HTTP {error.code}") from error
     except urllib.error.URLError as error:
         raise BuienError(f"{host} is unreachable ({error.reason})") from error
-    except (OSError, ValueError) as error:
-        raise BuienError(f"no usable answer from {host} ({error})") from error
+    except (OSError, ValueError, http.client.HTTPException) as error:
+        raise BuienError(f"no usable answer from {host} ({error!r})") from error
 
 
 def lookup(text, choose=False):
@@ -153,9 +190,13 @@ def search_places(name):
     return (fetch_json(GEOCODE_URL + query) or {}).get("results") or []
 
 
+def user_dir(variable, default):
+    """buien's own folder under an XDG base folder such as XDG_CONFIG_HOME."""
+    return Path(os.environ.get(variable) or Path.home() / default) / "buien"
+
+
 def places_file():
-    config = os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config"
-    return Path(config) / "buien" / "places.json"
+    return user_dir("XDG_CONFIG_HOME", ".config") / "places.json"
 
 
 def load_places():
@@ -164,17 +205,30 @@ def load_places():
     if not path.exists():
         return {}
     try:
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding="utf-8"))
         return {name: Place(place["name"], float(place["lat"]), float(place["lon"])) for name, place in data.items()}
     except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
         raise BuienError(f"{path} is unreadable ({error!r}), fix it or remove it and save your places again") from error
 
 
 def write_places(places):
-    path = places_file()
-    path.parent.mkdir(parents=True, exist_ok=True)
     data = {name: place._asdict() for name, place in sorted(places.items())}
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+    write_atomic(places_file(), json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+
+
+def write_atomic(path, text):
+    """Writes through a temporary file, so a write that fails halfway leaves the old file whole."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", delete=False)
+    try:
+        with temporary:
+            temporary.write(text)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary.name, path)
+    except BaseException:
+        os.unlink(temporary.name)
+        raise
 
 
 def save_place(name, place):
@@ -197,15 +251,15 @@ def forget_place(name):
     print(f"forgot {name}", file=sys.stderr)
 
 
-def print_places():
+def print_places(names_only=False):
     places = load_places()
-    if not places:
+    if not places and not names_only:
         print("no saved places yet, save one with buien --home <place> or buien --save <name> <place>")
         return
-    width = max(map(len, places))
+    width = max(map(len, places), default=0)
     for name in sorted(places, key=lambda name: (name != HOME, name)):
         place = places[name]
-        print(f"{name.ljust(width)}  {place.name} ({place.lat:.2f}, {place.lon:.2f})")
+        print(name if names_only else f"{name.ljust(width)}  {place.name} ({place.lat:.2f}, {place.lon:.2f})")
 
 
 def ask_home():
@@ -248,22 +302,86 @@ def save_target(options):
 
 
 def fetch_forecast(place, now):
-    data = fetch_json(FORECAST_URL.format(lat=place.lat, lon=place.lon))
+    """From the cache while it is fresh, else from Buienradar, and from the cache again when Buienradar is unreachable."""
+    cached = read_cache(place)
+    if cached and timedelta(0) <= now - cached.fetched < CACHE_FRESH:
+        ahead = slots_ahead(cached.slots, now)
+        if ahead:
+            return ahead
+    try:
+        data = fetch_json(FORECAST_URL.format(lat=place.lat, lon=place.lon))
+    except BuienError as error:
+        return fall_back(cached, now, error)
     if data is None:
         raise BuienError(f"Buienradar has no radar for {place.name}, only for the Netherlands, Belgium and the border regions")
-    return parse_forecast(data, now)
+    slots = parse_forecast(data, now)
+    write_cache(place, now, data)
+    return slots
+
+
+def fall_back(cached, now, error):
+    """The cached forecast when Buienradar cannot be reached, as long as some of it lies ahead."""
+    ahead = slots_ahead(cached.slots, now) if cached else []
+    if not ahead:
+        raise error
+    print(f"buien: {error}, showing the forecast from {clock(cached.fetched.astimezone())}", file=sys.stderr)
+    return ahead
+
+
+def cache_file(place):
+    return user_dir("XDG_CACHE_HOME", ".cache") / f"{place.lat:.2f},{place.lon:.2f}.json"
+
+
+def read_cache(place):
+    """The last forecast fetched for this place; an unreadable cache counts as none and the next fetch rewrites it."""
+    path = cache_file(place)
+    if not path.exists():
+        return None
+    try:
+        cached = json.loads(path.read_text(encoding="utf-8"))
+        fetched = datetime.fromisoformat(cached["fetched"])
+        if fetched.tzinfo is None:
+            return None
+        return Cached(fetched, parse_slots(cached["data"]))
+    except (OSError, ValueError, KeyError, TypeError, BuienError):
+        return None
+
+
+def write_cache(place, now, data):
+    path = cache_file(place)
+    try:
+        write_atomic(path, json.dumps({"fetched": now.isoformat(), "data": data}))
+        prune_cache(path.parent, now)
+    except OSError as error:
+        print(f"buien: could not cache the forecast ({error})", file=sys.stderr)
+
+
+def prune_cache(folder, now):
+    """Removes cached forecasts that no longer reach past now."""
+    oldest = (now - CACHE_KEEP).timestamp()
+    for path in folder.glob("*.json"):
+        with contextlib.suppress(FileNotFoundError):  # another buien may be pruning too
+            if path.stat().st_mtime < oldest:
+                path.unlink()
 
 
 def parse_forecast(data, now):
     """The 5-minute slots from the one running at now on, in local time."""
+    ahead = slots_ahead(parse_slots(data), now)
+    if not ahead:
+        raise BuienError("Buienradar's forecast is out of date, try again in a moment")
+    return ahead
+
+
+def parse_slots(data):
     try:
-        slots = [Slot(utc_to_local(f["utcdatetime"]), float(f["precipitation"])) for f in data["forecasts"]]
+        return [Slot(utc_to_local(f["utcdatetime"]), float(f["precipitation"])) for f in data["forecasts"]]
     except (KeyError, TypeError, ValueError) as error:
         raise BuienError(f"Buienradar sent an unexpected answer ({error!r})") from error
-    upcoming = [slot for slot in slots if slot.time + STEP > now]
-    if not upcoming:
-        raise BuienError("Buienradar's forecast is out of date, try again in a moment")
-    return upcoming
+
+
+def slots_ahead(slots, now):
+    return [slot for slot in slots if slot.time + STEP > now]
 
 
 def utc_to_local(text):
@@ -381,6 +499,9 @@ def chart_rows(slots, cell, paint):
             fill = min(8, max(0, level - row * 8))
             cells.append(paint.color(BLOCKS[fill] * cell, kind_of(slot.mm).color) if fill else " " * cell)
         rows.append("".join(cells).rstrip())
+    dry = "no rain in sight"
+    if not any(levels) and len(dry) <= len(slots) * cell:
+        rows[ROWS // 2] = paint.dim(dry.center(len(slots) * cell).rstrip())
     return rows
 
 
@@ -432,15 +553,79 @@ def to_json(place, slots):
     }
 
 
-def use_color():
-    return sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+def completion_script(shell):
+    """The script that teaches a shell buien's options and your saved places."""
+    scripts = {"bash": bash_completion, "fish": fish_completion, "zsh": zsh_completion}
+    if shell not in scripts:
+        raise BuienError(f"say which shell to complete for: {', '.join(SHELLS)}")
+    return scripts[shell]()
+
+
+def zsh_completion():
+    specs = []
+    for flag in FLAGS:
+        for name in filter(None, (flag.short, flag.long)):
+            arguments = f":shell:({' '.join(SHELLS)})" if name == "--completions" else ""
+            specs.append(f"    '{name}[{flag.about}]{arguments}' \\")
+    return "\n".join([
+        "#compdef buien",
+        "_buien() {",
+        "  local -a places",
+        '  places=(${(f)"$(buien --places --short 2>/dev/null)"})',
+        "  _arguments \\",
+        *specs,
+        "    '*:place:compadd -a places'",
+        "}",
+        'if [[ "$funcstack[1]" == _buien ]]; then _buien "$@"; else compdef _buien buien; fi',
+    ])
+
+
+def bash_completion():
+    names = " ".join(name for flag in FLAGS for name in (flag.short, flag.long) if name)
+    shells = " ".join(SHELLS)
+    return "\n".join([
+        "_buien() {",
+        '  local cur="${COMP_WORDS[COMP_CWORD]}"',
+        '  if [[ "${COMP_WORDS[COMP_CWORD-1]}" == --completions ]]; then',
+        f'    COMPREPLY=($(compgen -W "{shells}" -- "$cur"))',
+        '  elif [[ "$cur" == -* ]]; then',
+        f'    COMPREPLY=($(compgen -W "{names}" -- "$cur"))',
+        "  else",
+        "    local IFS=$'\\n'",
+        '    COMPREPLY=($(compgen -W "$(buien --places --short 2>/dev/null)" -- "$cur"))',
+        "  fi",
+        "}",
+        "complete -F _buien buien",
+    ])
+
+
+def fish_completion():
+    lines = ["complete -c buien -f"]
+    for flag in FLAGS:
+        short = f" -s {flag.short[1:]}" if flag.short else ""
+        arguments = f" -x -a '{' '.join(SHELLS)}'" if flag.long == "--completions" else ""
+        lines.append(f"complete -c buien{short} -l {flag.long[2:]}{arguments} -d '{flag.about}'")
+    lines.append("complete -c buien -a '(buien --places --short 2>/dev/null)' -d 'saved place'")
+    return "\n".join(lines)
+
+
+def use_color(options):
+    """--color or --no-color first, then NO_COLOR, then FORCE_COLOR, else only in a terminal."""
+    if options.color is not None:
+        return options.color
+    if os.environ.get("NO_COLOR"):
+        return False
+    return bool(os.environ.get("FORCE_COLOR")) or sys.stdout.isatty()
 
 
 def parse_args(argv):
     options = Options()
-    for arg in argv:
+    args = iter(argv)
+    for arg in args:
         if arg in ("-h", "--help"):
             options.help = True
+        elif arg == "--version":
+            options.version = True
         elif arg == "--home":
             options.home = True
         elif arg == "--save":
@@ -455,6 +640,10 @@ def parse_args(argv):
             options.short = True
         elif arg == "--json":
             options.as_json = True
+        elif arg in ("--color", "--no-color"):
+            options.color = arg == "--color"
+        elif arg == "--completions":
+            options.completions = next(args, "")
         elif arg.startswith("-") and not COORDS.match(arg):
             raise BuienError(f"unknown option {arg}, see buien -h")
         else:
@@ -466,8 +655,14 @@ def run(options):
     if options.help:
         print(__doc__.strip())
         return 0
+    if options.version:
+        print(f"buien {__version__}")
+        return 0
+    if options.completions is not None:
+        print(completion_script(options.completions))
+        return 0
     if options.list_places:
-        print_places()
+        print_places(names_only=options.short)
         return 0
     if options.forget:
         if not options.words:
@@ -484,7 +679,7 @@ def run(options):
     elif options.short:
         print(summarize(slots))
     else:
-        print(render(place, slots, now, use_color(), shutil.get_terminal_size().columns))
+        print(render(place, slots, now, use_color(options), shutil.get_terminal_size().columns))
     return 0
 
 

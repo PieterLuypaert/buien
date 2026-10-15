@@ -5,11 +5,14 @@ import importlib.util
 import io
 import json
 import os
+import re
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
 import urllib.error
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -17,6 +20,19 @@ _loader = importlib.machinery.SourceFileLoader("buien", os.path.join(HERE, "buie
 buien = importlib.util.module_from_spec(importlib.util.spec_from_loader("buien", _loader))
 sys.modules["buien"] = buien
 _loader.exec_module(buien)
+
+_module_patches = contextlib.ExitStack()
+
+
+def setUpModule():
+    """Keeps every test away from the real cache in ~/.cache."""
+    cache = _module_patches.enter_context(tempfile.TemporaryDirectory())
+    _module_patches.enter_context(mock.patch.dict(os.environ, {"XDG_CACHE_HOME": cache}))
+
+
+def tearDownModule():
+    _module_patches.close()
+
 
 START = datetime(2026, 10, 13, 12, 30).astimezone()
 GENT = buien.Place("Gent", 51.05, 3.72)
@@ -97,6 +113,15 @@ class ChartTest(unittest.TestCase):
         self.assertFalse(set(text) & set(buien.BLOCKS.strip()))
         self.assertIn("dry until at least 14:30", text)
 
+    def test_a_dry_chart_says_so_in_its_middle_row(self):
+        rows = buien.chart_rows(slots(*[0] * 24), 2, buien.Paint(False))
+        self.assertEqual(rows[0], "")
+        self.assertEqual(rows[1].strip(), "no rain in sight")
+        self.assertEqual(len(rows[1]) - len(rows[1].lstrip()), (48 - len("no rain in sight")) // 2)
+
+    def test_a_dry_chart_too_narrow_for_the_words_stays_empty(self):
+        self.assertEqual(buien.chart_rows(slots(0, 0, 0), 2, buien.Paint(False)), ["", "", ""])
+
     def test_a_shower_draws_bars_in_its_own_columns(self):
         rows = buien.chart_rows(slots(0, 0, 10, 0), 2, buien.Paint(False))
         self.assertEqual([row.rstrip() for row in rows], ["    ██", "    ██", "    ██"])
@@ -128,25 +153,27 @@ class ChartTest(unittest.TestCase):
         self.assertNotIn("\033[", self.render(forecast, color=False))
 
 
-class ForecastTest(unittest.TestCase):
-    def data(self, *mm):
-        return {
-            "forecasts": [
-                {"utcdatetime": f"2026-10-13T10:{30 + 5 * index}:00", "precipitation": value}
-                for index, value in enumerate(mm)
-            ]
-        }
+def radar_answer(*mm):
+    """Buienradar's answer with a slot every five minutes from 10:30 UTC."""
+    return {
+        "forecasts": [
+            {"utcdatetime": f"2026-10-13T10:{30 + 5 * index}:00", "precipitation": value}
+            for index, value in enumerate(mm)
+        ]
+    }
 
+
+class ForecastTest(unittest.TestCase):
     def test_starts_at_the_slot_that_is_running(self):
         now = datetime(2026, 10, 13, 10, 37, tzinfo=timezone.utc)
-        forecast = buien.parse_forecast(self.data(0, 0.5, 1.5, 0), now)
+        forecast = buien.parse_forecast(radar_answer(0, 0.5, 1.5, 0), now)
         self.assertEqual(forecast[0].time, datetime(2026, 10, 13, 10, 35, tzinfo=timezone.utc))
         self.assertEqual([slot.mm for slot in forecast], [0.5, 1.5, 0])
 
     def test_stale_forecast(self):
         now = datetime(2026, 10, 13, 12, 0, tzinfo=timezone.utc)
         with self.assertRaisesRegex(buien.BuienError, "out of date"):
-            buien.parse_forecast(self.data(0, 0), now)
+            buien.parse_forecast(radar_answer(0, 0), now)
 
     def test_unexpected_answer(self):
         with self.assertRaisesRegex(buien.BuienError, "unexpected"):
@@ -157,11 +184,102 @@ class ForecastTest(unittest.TestCase):
             with self.assertRaisesRegex(buien.BuienError, "no radar for Madrid"):
                 buien.fetch_forecast(buien.Place("Madrid", 40.4, -3.7), START)
 
+    def test_a_connection_that_drops_halfway(self):
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.side_effect = buien.http.client.IncompleteRead(b"{")
+        with mock.patch.object(buien.urllib.request, "urlopen", return_value=response):
+            with self.assertRaisesRegex(buien.BuienError, "no usable answer from graphdata.buienradar.nl"):
+                buien.fetch_json("https://graphdata.buienradar.nl/x")
+
     def test_unreachable(self):
         error = urllib.error.URLError("no route")
         with mock.patch.object(buien.urllib.request, "urlopen", side_effect=error):
             with self.assertRaisesRegex(buien.BuienError, "unreachable"):
                 buien.fetch_json("https://graphdata.buienradar.nl/x")
+
+
+class CacheTest(unittest.TestCase):
+    NOW = datetime(2026, 10, 13, 10, 32, tzinfo=timezone.utc)
+    UNREACHABLE = buien.BuienError("graphdata.buienradar.nl is unreachable (no route)")
+
+    def setUp(self):
+        cache = tempfile.TemporaryDirectory()
+        self.addCleanup(cache.cleanup)
+        mock.patch.dict(os.environ, {"XDG_CACHE_HOME": cache.name}).start()
+        self.fetch_json = mock.patch.object(buien, "fetch_json", return_value=radar_answer(0, 0, 0, 1, 0)).start()
+        self.addCleanup(mock.patch.stopall)
+
+    def fetch(self, minutes_later=0):
+        return buien.fetch_forecast(GENT, self.NOW + timedelta(minutes=minutes_later))
+
+    def test_a_fresh_forecast_is_reused(self):
+        self.fetch()
+        self.fetch(4)
+        self.assertEqual(self.fetch_json.call_count, 1)
+
+    def test_an_older_one_is_fetched_again(self):
+        self.fetch()
+        self.fetch(5)
+        self.assertEqual(self.fetch_json.call_count, 2)
+
+    def test_offline_shows_the_last_forecast(self):
+        self.fetch()
+        self.fetch_json.side_effect = self.UNREACHABLE
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            forecast = self.fetch(10)
+        self.assertEqual([slot.mm for slot in forecast], [0, 1, 0])
+        self.assertIn(f"unreachable (no route), showing the forecast from {buien.clock(self.NOW.astimezone())}", err.getvalue())
+
+    def test_offline_without_a_forecast(self):
+        self.fetch_json.side_effect = self.UNREACHABLE
+        with self.assertRaisesRegex(buien.BuienError, "unreachable"):
+            self.fetch()
+
+    def test_offline_when_the_last_forecast_is_over(self):
+        self.fetch()
+        self.fetch_json.side_effect = self.UNREACHABLE
+        with self.assertRaisesRegex(buien.BuienError, "unreachable"):
+            self.fetch(60)
+
+    def test_an_unreadable_cache_is_fetched_again(self):
+        path = buien.cache_file(GENT)
+        path.parent.mkdir(parents=True)
+        path.write_text("{not json")
+        self.assertEqual([slot.mm for slot in self.fetch()], [0, 0, 0, 1, 0])
+        self.assertEqual(self.fetch_json.call_count, 1)
+
+    def test_a_broken_answer_keeps_the_last_good_forecast(self):
+        self.fetch()
+        self.fetch_json.return_value = {"forecasts": [{"precipitation": 1}]}
+        with self.assertRaisesRegex(buien.BuienError, "unexpected answer"):
+            self.fetch(5)
+        self.fetch_json.side_effect = self.UNREACHABLE
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual([slot.mm for slot in self.fetch(6)], [0, 0, 1, 0])
+
+    def test_a_cache_without_a_time_zone_counts_as_none(self):
+        path = buien.cache_file(GENT)
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({"fetched": "2026-10-13T10:31:00", "data": radar_answer(0)}))
+        self.fetch()
+        self.assertEqual(self.fetch_json.call_count, 1)
+
+    def test_forecasts_past_three_hours_old_are_removed(self):
+        old = buien.cache_file(buien.Place("Brussel", 50.85, 4.35))
+        old.parent.mkdir(parents=True)
+        old.write_text("{}")
+        hours_ago = (self.NOW - timedelta(hours=4)).timestamp()
+        os.utime(old, (hours_ago, hours_ago))
+        self.fetch()
+        self.assertFalse(old.exists())
+        self.assertTrue(buien.cache_file(GENT).exists())
+
+    def test_no_radar_is_not_cached(self):
+        self.fetch_json.return_value = None
+        with self.assertRaisesRegex(buien.BuienError, "no radar"):
+            self.fetch()
+        self.assertFalse(buien.cache_file(GENT).exists())
 
 
 class LookupTest(unittest.TestCase):
@@ -311,6 +429,17 @@ class PlacesTest(unittest.TestCase):
         self.assertIn("Leuven · ", plain(out))
         self.assertEqual(buien.load_places()["home"], buien.Place("Leuven", 51.05, 3.72))
 
+    def test_a_failed_save_keeps_the_places_file_whole(self):
+        run_main("--home", "gent")
+        with open(self.places_file) as places:
+            before = places.read()
+        with mock.patch.object(buien.os, "replace", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                run_main("--save", "work", "brussel")
+        with open(self.places_file) as places:
+            self.assertEqual(places.read(), before)
+        self.assertEqual(os.listdir(os.path.dirname(self.places_file)), ["places.json"])
+
     def test_unreadable_places(self):
         os.makedirs(os.path.dirname(self.places_file))
         with open(self.places_file, "w") as file:
@@ -328,6 +457,56 @@ BERGEN = {"results": [
     {"name": "Bergen", "country_code": "NL", "country": "Nederland", "admin1": "Noord-Holland",
      "admin2": "Bergen (NH.)", "latitude": 52.67, "longitude": 4.70},
 ]}
+
+
+class CompletionTest(unittest.TestCase):
+    def setUp(self):
+        config = tempfile.TemporaryDirectory()
+        self.addCleanup(config.cleanup)
+        mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": config.name}).start()
+        self.addCleanup(mock.patch.stopall)
+
+    def test_every_flag_in_the_help_is_completed_and_understood(self):
+        documented = set(re.findall(r"--[a-z-]+", buien.__doc__))
+        completed = {flag.long for flag in buien.FLAGS}
+        self.assertEqual(completed - {"--help"}, documented)
+        for flag in buien.FLAGS:
+            for name in filter(None, (flag.short, flag.long)):
+                buien.parse_args([name])
+
+    def test_place_names_for_completion(self):
+        code, out, _ = run_main("--places", "--short")
+        self.assertEqual((code, out), (0, ""))
+        buien.write_places({"work": GENT, "home": GENT, "sint niklaas": GENT})
+        code, out, _ = run_main("--places", "--short")
+        self.assertEqual(out, "home\nsint niklaas\nwork\n")
+
+    def test_an_unknown_shell(self):
+        code, _, err = run_main("--completions", "tcsh")
+        self.assertEqual(code, 1)
+        self.assertIn("say which shell to complete for: bash, fish, zsh", err)
+
+    @unittest.skipUnless(shutil.which("bash"), "needs bash")
+    def test_bash_completes_options_shells_and_saved_places(self):
+        script = buien.completion_script("bash")
+        probe = (
+            'buien() { printf "home\\nwork\\nsint niklaas\\n"; }\n'
+            f"{script}\n"
+            'for words in "buien w" "buien s" "buien --sh" "buien --completions z"; do\n'
+            '  read -ra COMP_WORDS <<< "$words"; COMP_CWORD=$(( ${#COMP_WORDS[@]} - 1 ))\n'
+            '  _buien; (IFS=,; echo "${COMPREPLY[*]}")\n'
+            "done\n"
+        )
+        out = subprocess.run(["bash", "-c", probe], capture_output=True, text=True, check=True).stdout
+        self.assertEqual(out.splitlines(), ["work", "sint niklaas", "--short", "zsh"])
+
+    def test_scripts_are_valid_for_their_shell(self):
+        for shell in buien.SHELLS:
+            with self.subTest(shell=shell):
+                if not shutil.which(shell):
+                    self.skipTest(f"needs {shell}")
+                result = subprocess.run([shell, "-n"], input=buien.completion_script(shell), capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
 
 
 class SearchTest(unittest.TestCase):
@@ -420,6 +599,24 @@ class CommandTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("buien gent", out)
 
+    def test_version(self):
+        code, out, _ = run_main("--version")
+        self.assertEqual(code, 0)
+        self.assertEqual(out, f"buien {buien.__version__}\n")
+
+    def test_the_package_has_the_same_version(self):
+        with open(os.path.join(HERE, "pyproject.toml")) as pyproject:
+            version = re.search(r'^version = "(.+)"$', pyproject.read(), re.MULTILINE)[1]
+        self.assertEqual(version, buien.__version__)
+
+    def test_requests_name_buien_and_its_version(self):
+        response = mock.MagicMock()
+        response.__enter__.return_value = io.BytesIO(b"{}")
+        with mock.patch.object(buien.urllib.request, "urlopen", return_value=response) as urlopen:
+            buien.fetch_json("https://graphdata.buienradar.nl/x")
+        agent = urlopen.call_args.args[0].get_header("User-agent")
+        self.assertEqual(agent, f"buien/{buien.__version__} (+https://github.com/PieterLuypaert/buien)")
+
     def run_with_forecast(self, *argv):
         with mock.patch.object(buien, "lookup", return_value=GENT), \
                 mock.patch.object(buien, "fetch_forecast", return_value=slots(0, 1.5, 0)):
@@ -438,6 +635,22 @@ class CommandTest(unittest.TestCase):
         self.assertEqual(data["summary"], "dry until 12:35, then 5 min of light rain")
         self.assertEqual([slot["mm_per_hour"] for slot in data["forecast"]], [0, 1.5, 0])
         self.assertEqual(data["forecast"][1]["time"], START.replace(minute=35).isoformat(timespec="minutes"))
+
+    def test_color_follows_the_flags_then_the_environment_then_the_terminal(self):
+        def color(*argv, env=None, terminal=False):
+            with mock.patch.dict(os.environ, env or {}), \
+                    mock.patch.object(buien.sys.stdout, "isatty", return_value=terminal):
+                return buien.use_color(buien.parse_args(list(argv)))
+
+        with mock.patch.dict(os.environ):
+            os.environ.pop("NO_COLOR", None)
+            os.environ.pop("FORCE_COLOR", None)
+            self.assertTrue(color(terminal=True))
+            self.assertFalse(color())
+            self.assertFalse(color(env={"NO_COLOR": "1"}, terminal=True))
+            self.assertTrue(color(env={"FORCE_COLOR": "1"}))
+            self.assertTrue(color("--color", env={"NO_COLOR": "1"}))
+            self.assertFalse(color("--no-color", terminal=True))
 
     def test_shows_the_chart(self):
         with mock.patch.object(buien, "lookup", return_value=GENT), \

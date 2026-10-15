@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "buien"
+version = "0.1.0"
+description = "The rain for the next three hours as a chart in your terminal, from Buienradar"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Pieter Luypaert" }]
+requires-python = ">=3.9"
+classifiers = [
+    "Environment :: Console",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Atmospheric Science",
+]
+
+[project.urls]
+Homepage = "https://github.com/PieterLuypaert/buien"
+
+[tool.setuptools]
+# buien stays one file without .py, so the curl install keeps working
+script-files = ["buien"]
+py-modules = []
+packages = []

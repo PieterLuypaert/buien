@@ -1094,7 +1094,7 @@ def fit(text, width):
         else:
             parts.append(part[:room])
             room -= len(parts[-1])
-    return "".join(parts) + "\033[0m"
+    return "".join(parts) + ("\033[0m" if ANSI.search(text) else "")
 
 
 @dataclass

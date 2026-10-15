@@ -704,6 +704,12 @@ class LiveTest(LiveCase):
         self.assertEqual(self.screen()[-1], " " + buien.LIVE_KEYS)
         self.assertNotIn("unreachable", "\n".join(self.screen()))
 
+    def test_cutting_plain_text_adds_no_colour_codes(self):
+        self.assertEqual(buien.fit("x" * 20, 5), "xxxxx")
+        cut = buien.fit("\033[1mbold text\033[0m", 4)
+        self.assertEqual(plain(cut), "bold")
+        self.assertTrue(cut.endswith("\033[0m"))
+
     def test_every_line_fits_the_terminal(self):
         self.live.note = "x" * 200
         for line in self.live.screen(self.NOW, 50, 12, True):

@@ -610,6 +610,24 @@ class LiveTest(LiveCase):
                 mock.patch.object(buien.select, "select", return_value=([0], [], [])):
             self.assertEqual(buien.read_keys(0), ["L", "i", "è", "g", "e"])
 
+    def test_the_mouse_wheel_moves_through_the_hours_and_clicks_do_nothing(self):
+        keys = buien.parse_keys("\033[<65;10;5M\033[<65;10;5M\033[<64;10;5M\033[<0;3;4M\033[<0;3;4m")
+        self.assertEqual(keys, ["wheel-down", "wheel-down", "wheel-up", "mouse", "mouse"])
+        self.assertEqual(self.press(*keys), [True] * 5)
+        self.assertEqual(self.live.cursor, 1)
+        self.assertFalse(self.live.playing)
+
+    def test_the_older_mouse_format_never_reads_as_keys(self):
+        events = b"\033[Ma!!\033[M`\xf0!\033[M qqq"
+        with mock.patch.object(buien.os, "read", return_value=events), \
+                mock.patch.object(buien.select, "select", return_value=([], [], [])):
+            self.assertEqual(buien.read_keys(0), ["wheel-down", "wheel-up", "mouse", "q"])
+
+    def test_a_wheel_event_cut_in_two_by_a_read_is_completed(self):
+        with mock.patch.object(buien.os, "read", side_effect=[b"\033[<65;1", b"0;5M"]), \
+                mock.patch.object(buien.select, "select", return_value=([0], [], [])):
+            self.assertEqual(buien.read_keys(0), ["wheel-down"])
+
     def test_alt_with_a_key_is_one_key_that_does_nothing(self):
         self.assertEqual(buien.parse_keys("\033b\033\033"), ["\033b", "esc", "esc"])
         self.assertEqual(self.press("\033b"), [True])

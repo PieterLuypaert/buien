@@ -28,9 +28,10 @@
                       tab completion for zsh, bash or fish, see the README
   buien --version     the version of buien
 
-In the live screen the left and right arrows move through the hours and
-pause the map there, space plays it again, up and down go through your
-saved places, / searches a place, s saves it, r fetches again and q quits.
+In the live screen the left and right arrows or the scroll wheel move
+through the hours and pause the map there, space plays it again, up and
+down go through your saved places, / searches a place, s saves it, r
+fetches again and q quits.
 Piped into another command, buien prints the chart as text.
 
 Saved places, home among them, are kept in ~/.config/buien/places.json.
@@ -1035,21 +1036,31 @@ BESIDE_MIN_MAP = 50
 Layout = namedtuple("Layout", "beside map_size")
 MENU_KEYS = "↑↓ choose  enter open  esc back"
 LIVE_TICK = 0.5
-ENTER_SCREEN = "\033[?1049h\033[?25l"
-LEAVE_SCREEN = "\033[?25h\033[?1049l"
+ENTER_SCREEN = "\033[?1049h\033[?25l\033[?1000h\033[?1006h"
+LEAVE_SCREEN = "\033[?1006l\033[?1000l\033[?25h\033[?1049l"
 KEY_NAMES = {
     "\033[A": "up", "\033OA": "up", "\033[B": "down", "\033OB": "down",
     "\033[C": "right", "\033OC": "right", "\033[D": "left", "\033OD": "left",
     "\t": "tab", "\033[Z": "shift-tab", "\r": "enter", "\n": "enter",
     "\033": "esc", "\x7f": "backspace", "\x08": "backspace",
 }
-KEYS = re.compile(r"\033\[[0-9;]*[A-Za-z~]|\033O[A-Za-z]|\033[^\[O\033]|\033|.", re.DOTALL)
-CUT_SEQUENCE = re.compile(rb"\033(\[[0-9;]*|O)?$")
+KEYS = re.compile(r"\033\[<[0-9;]*[Mm]|\033\[[0-9;]*[A-Za-z~]|\033O[A-Za-z]|\033[^\[O\033]|\033|.", re.DOTALL)
+OLD_MOUSE = re.compile(rb"\033\[M(.)(.)(.)", re.DOTALL)
+CUT_SEQUENCE = re.compile(rb"\033(\[<?[0-9;]*|\[M.{0,2}|O)?$", re.DOTALL)
+MOUSE = re.compile(r"\033\[<(\d+);\d+;\d+[Mm]")
+WHEEL = {64: "wheel-up", 65: "wheel-down"}
 
 
 def parse_keys(text):
-    """Names such as 'left' or 'enter' for what the terminal sent; plain characters stay as they are."""
-    return [KEY_NAMES.get(key, key) for key in KEYS.findall(text)]
+    """Names such as 'left', 'enter' or 'wheel-up' for what the terminal sent; plain characters stay as they are."""
+    return [key_name(key) for key in KEYS.findall(text)]
+
+
+def key_name(key):
+    mouse = MOUSE.fullmatch(key)
+    if mouse:
+        return WHEEL.get(int(mouse[1]), "mouse")
+    return KEY_NAMES.get(key, key)
 
 
 def read_keys(fd):
@@ -1057,6 +1068,7 @@ def read_keys(fd):
     data = os.read(fd, 1024)
     while cut_short(data) and select.select([fd], [], [], 0.05)[0]:
         data += os.read(fd, 1024)
+    data = OLD_MOUSE.sub(lambda event: b"\033[<%d;%d;%dM" % tuple(byte[0] - 32 for byte in event.groups()), data)
     return parse_keys(data.decode(errors="ignore"))
 
 
@@ -1242,9 +1254,9 @@ class Live:
 
     def view_key(self, key):
         """A key on the map and the chart."""
-        if key in ("left", "right"):
+        if key in ("left", "right", "wheel-up", "wheel-down"):
             self.playing = False
-            self.move_cursor(-1 if key == "left" else 1)
+            self.move_cursor(-1 if key in ("left", "wheel-up") else 1)
         elif key == " ":
             self.toggle_play()
         elif key in ("up", "down", "tab", "shift-tab"):

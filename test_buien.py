@@ -7,11 +7,13 @@ import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
 import unittest
 import urllib.error
+import zlib
 from datetime import datetime, timedelta, timezone
 from unittest import mock
 
@@ -782,6 +784,66 @@ class LiveSearchTest(LiveCase):
         with mock.patch.object(buien, "write_places", side_effect=PermissionError("read-only file system")):
             self.press("/", *"bergen", "enter", "s", *"mons", "enter")
         self.assertEqual(self.screen()[-2], " read-only file system")
+
+
+def encode_png(rows, kind=0, channels=4):
+    """A PNG of rows of pixel bytes, each row put through filter kind, for the decoder to undo."""
+    raw, prior = bytearray(), bytes(len(rows[0]))
+    for row in rows:
+        raw.append(kind)
+        raw += png_filter(kind, bytes(row), prior, channels)
+        prior = bytes(row)
+    header = struct.pack(">IIBBBBB", len(rows[0]) // channels, len(rows), 8, 6 if channels == 4 else 2, 0, 0, 0)
+    return buien.PNG_SIGNATURE + png_chunk(b"IHDR", header) + png_chunk(b"IDAT", zlib.compress(bytes(raw))) + png_chunk(b"IEND", b"")
+
+
+def png_chunk(kind, body):
+    return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body))
+
+
+def png_filter(kind, row, prior, bpp):
+    filtered = bytearray()
+    for i, value in enumerate(row):
+        left, corner = (row[i - bpp], prior[i - bpp]) if i >= bpp else (0, 0)
+        up = prior[i]
+        estimate = left + up - corner
+        nearest = min((abs(estimate - left), 0, left), (abs(estimate - up), 1, up), (abs(estimate - corner), 2, corner))[2]
+        filtered.append((value - [0, left, up, (left + up) // 2, nearest][kind]) & 255)
+    return filtered
+
+
+class PngTest(unittest.TestCase):
+    ROWS = [bytes(range(i, i + 12)) for i in (3, 90, 200)]
+
+    def test_every_row_filter_is_undone(self):
+        for kind in range(5):
+            with self.subTest(kind=kind):
+                picture = buien.decode_png(encode_png(self.ROWS, kind))
+                self.assertEqual((picture.width, picture.height, picture.channels), (3, 3, 4))
+                self.assertEqual([bytes(row) for row in picture.rows], self.ROWS)
+
+    def test_rgb_without_alpha(self):
+        picture = buien.decode_png(encode_png(self.ROWS, 4, channels=3))
+        self.assertEqual((picture.width, picture.channels), (4, 3))
+        self.assertEqual([bytes(row) for row in picture.rows], self.ROWS)
+
+    def test_not_a_png(self):
+        with self.assertRaisesRegex(buien.BuienError, "not a PNG"):
+            buien.decode_png(b"GIF89a")
+
+    def test_a_short_header(self):
+        with self.assertRaisesRegex(buien.BuienError, "cannot read"):
+            buien.decode_png(buien.PNG_SIGNATURE + png_chunk(b"IHDR", b"\x00\x01"))
+
+    def test_a_kind_buien_cannot_read(self):
+        palette = struct.pack(">IIBBBBB", 1, 1, 8, 3, 0, 0, 0)
+        with self.assertRaisesRegex(buien.BuienError, "cannot read"):
+            buien.decode_png(buien.PNG_SIGNATURE + png_chunk(b"IHDR", palette))
+
+    def test_a_broken_image(self):
+        header = struct.pack(">IIBBBBB", 1, 1, 8, 6, 0, 0, 0)
+        with self.assertRaisesRegex(buien.BuienError, "broken radar image"):
+            buien.decode_png(buien.PNG_SIGNATURE + png_chunk(b"IHDR", header) + png_chunk(b"IDAT", b"not zlib"))
 
 
 class SearchTest(unittest.TestCase):

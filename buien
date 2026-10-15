@@ -43,11 +43,13 @@ import re
 import select
 import shutil
 import signal
+import struct
 import sys
 import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 from collections import namedtuple
 from dataclasses import dataclass, field
 from typing import Optional
@@ -135,11 +137,22 @@ class Options:
 
 def fetch_json(url):
     """The decoded JSON at url, or None when the server answers 404."""
+    data = fetch_bytes(url)
+    if data is None:
+        return None
+    try:
+        return json.loads(data)
+    except ValueError as error:
+        raise BuienError(f"no usable answer from {urllib.parse.urlsplit(url).hostname} ({error!r})") from error
+
+
+def fetch_bytes(url):
+    """What the server sends for url, or None when it answers 404."""
     host = urllib.parse.urlsplit(url).hostname
     request = urllib.request.Request(url, headers={"User-Agent": f"buien/{__version__} (+{REPO_URL})"})
     try:
         with urllib.request.urlopen(request, timeout=10) as response:
-            return json.load(response)
+            return response.read()
     except urllib.error.HTTPError as error:
         if error.code == 404:
             return None
@@ -148,6 +161,73 @@ def fetch_json(url):
         raise BuienError(f"{host} is unreachable ({error.reason})") from error
     except (OSError, ValueError, http.client.HTTPException) as error:
         raise BuienError(f"no usable answer from {host} ({error!r})") from error
+
+
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+Picture = namedtuple("Picture", "width height rows channels")
+
+
+def decode_png(data):
+    """The rows of bytes of an 8-bit RGB or RGBA PNG without interlacing, the kind Buienradar sends."""
+    if not data.startswith(PNG_SIGNATURE):
+        raise BuienError("Buienradar sent a radar image that is not a PNG")
+    header, compressed, position = None, bytearray(), len(PNG_SIGNATURE)
+    while position + 8 <= len(data):
+        length, kind = struct.unpack(">I4s", data[position:position + 8])
+        body = data[position + 8:position + 8 + length]
+        if kind == b"IHDR" and len(body) == 13:
+            header = struct.unpack(">IIBBBBB", body)
+        elif kind == b"IDAT":
+            compressed += body
+        position += 12 + length
+    if header is None or header[2] != 8 or header[3] not in (2, 6) or header[6]:
+        raise BuienError("Buienradar sent a radar image buien cannot read")
+    width, height, channels = header[0], header[1], 4 if header[3] == 6 else 3
+    try:
+        raw = zlib.decompress(bytes(compressed))
+    except zlib.error as error:
+        raise BuienError(f"Buienradar sent a broken radar image ({error})") from error
+    return Picture(width, height, unfilter(raw, width * channels, height, channels), channels)
+
+
+def unfilter(raw, stride, height, bpp):
+    """The rows of a PNG image, each with its filter undone."""
+    if len(raw) < (stride + 1) * height:
+        raise BuienError("Buienradar sent a radar image that ends too soon")
+    rows, prior = [], bytearray(stride)
+    for start in range(0, (stride + 1) * height, stride + 1):
+        line = bytearray(raw[start + 1:start + 1 + stride])
+        undo_filter(raw[start], line, prior, bpp)
+        rows.append(line)
+        prior = line
+    return rows
+
+
+def undo_filter(kind, line, prior, bpp):
+    """Undoes one of PNG's five row filters in place: none, sub, up, average or paeth."""
+    if kind == 1:
+        for i in range(bpp, len(line)):
+            line[i] = (line[i] + line[i - bpp]) & 255
+    elif kind == 2:
+        for i in range(len(line)):
+            line[i] = (line[i] + prior[i]) & 255
+    elif kind == 3:
+        for i in range(len(line)):
+            line[i] = (line[i] + (((line[i - bpp] if i >= bpp else 0) + prior[i]) >> 1)) & 255
+    elif kind == 4:
+        for i in range(len(line)):
+            left, up = (line[i - bpp], prior[i - bpp]) if i >= bpp else (0, 0)
+            line[i] = (line[i] + paeth(left, prior[i], up)) & 255
+    elif kind:
+        raise BuienError(f"Buienradar sent a radar image with an unknown filter ({kind})")
+
+
+def paeth(left, up, corner):
+    estimate = left + up - corner
+    to_left, to_up, to_corner = abs(estimate - left), abs(estimate - up), abs(estimate - corner)
+    if to_left <= to_up and to_left <= to_corner:
+        return left
+    return up if to_up <= to_corner else corner
 
 
 def lookup(text, choose=False):

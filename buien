@@ -34,7 +34,9 @@ Works in the Netherlands, Belgium and the border regions, as far as
 Buienradar's radar reaches. Colour is dropped with NO_COLOR or when the
 output is not a terminal, and kept with FORCE_COLOR.
 """
+import base64
 import contextlib
+import functools
 import http.client
 import json
 import math
@@ -228,6 +230,52 @@ def paeth(left, up, corner):
     if to_left <= to_up and to_left <= to_corner:
         return left
     return up if to_up <= to_corner else corner
+
+SEA, LAND_DARK, LAND_LIGHT, BORDER = range(4)
+MAP_MASK_SIZE = (264, 229)
+RADAR_BOUNDS = (49.5, 54.8, 0.0, 10.0)
+
+
+def shrink_mask(grid, width, height):
+    """grid scaled down to width x height: a border wherever one crosses a pixel, else what covers most of it."""
+    rows = []
+    for top, bottom in spans(len(grid), height):
+        row = []
+        for left, right in spans(len(grid[0]), width):
+            counts = [0, 0, 0, 0]
+            for line in grid[top:bottom]:
+                for value in line[left:right]:
+                    counts[value] += 1
+            row.append(BORDER if counts[BORDER] else counts.index(max(counts[:BORDER])))
+        rows.append(row)
+    return rows
+
+
+def spans(size, parts):
+    """[start, end) of each of parts equal stretches of size, none of them empty."""
+    return [(part * size // parts, max(part * size // parts + 1, (part + 1) * size // parts)) for part in range(parts)]
+
+
+@functools.lru_cache(maxsize=4)
+def map_mask(width, height):
+    """Sea, land and borders of the radar map at width x height pixels."""
+    full_width, full_height = MAP_MASK_SIZE
+    packed = zlib.decompress(base64.b64decode(MAP_MASK))
+    values = [byte >> shift & 3 for byte in packed for shift in (6, 4, 2, 0)]
+    grid = [values[y * full_width:(y + 1) * full_width] for y in range(full_height)]
+    return shrink_mask(grid, width, height)
+
+
+def mercator(lat):
+    return math.log(math.tan(math.pi / 4 + math.radians(lat) / 2))
+
+
+def map_position(place, width, height):
+    """The pixel where place lies on the radar map of width x height, or None when it lies off the map."""
+    south, north, west, east = RADAR_BOUNDS
+    x = int((place.lon - west) / (east - west) * width)
+    y = int((mercator(north) - mercator(place.lat)) / (mercator(north) - mercator(south)) * height)
+    return (x, y) if 0 <= x < width and 0 <= y < height else None
 
 
 def lookup(text, choose=False):
@@ -1265,6 +1313,44 @@ def main(argv=None):
     except KeyboardInterrupt:
         print(file=sys.stderr)
         return 130
+
+
+# Made by tools/make-map-mask.py from the map's own background on a dry day:
+# MAP_MASK_SIZE pixels of SEA, LAND_DARK, LAND_LIGHT or BORDER, four to a byte.
+MAP_MASK = (
+    "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"
+    "c3h4f6yP+2z9H3T9DBg="
+)
 
 
 if __name__ == "__main__":

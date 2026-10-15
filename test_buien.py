@@ -846,6 +846,43 @@ class PngTest(unittest.TestCase):
             buien.decode_png(buien.PNG_SIGNATURE + png_chunk(b"IHDR", header) + png_chunk(b"IDAT", b"not zlib"))
 
 
+class MapTest(unittest.TestCase):
+    def test_the_mask_has_its_size(self):
+        mask = buien.map_mask(*buien.MAP_MASK_SIZE)
+        self.assertEqual((len(mask[0]), len(mask)), buien.MAP_MASK_SIZE)
+
+    def test_places_land_where_they_lie(self):
+        width, height = buien.MAP_MASK_SIZE
+        mask = buien.map_mask(width, height)
+        places = {
+            "Buggenhout": (buien.Place("Buggenhout", 51.016, 4.202), buien.LAND_LIGHT),
+            "Utrecht": (buien.Place("Utrecht", 52.09, 5.12), buien.LAND_DARK),
+            "Sauerland": (buien.Place("Sauerland", 51.2, 8.0), buien.LAND_LIGHT),
+            "Lille": (buien.Place("Lille", 50.63, 3.06), buien.LAND_DARK),
+            "North Sea": (buien.Place("North Sea", 53.0, 3.0), buien.SEA),
+        }
+        for name, (place, land) in places.items():
+            with self.subTest(name):
+                x, y = buien.map_position(place, width, height)
+                self.assertEqual(mask[y][x], land)
+
+    def test_off_the_map(self):
+        self.assertIsNone(buien.map_position(buien.Place("Madrid", 40.4, -3.7), 100, 86))
+        self.assertIsNone(buien.map_position(buien.Place("London", 51.5, -0.12), 100, 86))
+
+    def test_north_is_up_and_stretched_as_on_a_web_map(self):
+        ys = [buien.map_position(buien.Place("", lat, 5.0), 264, 229)[1] for lat in (50, 52, 54)]
+        self.assertGreater(ys[0], ys[1])
+        self.assertGreater(ys[1] - ys[2], 0)
+        self.assertGreater(ys[0] - ys[1], 0)
+        steps = [buien.mercator(lat + 1) - buien.mercator(lat) for lat in (50, 53)]
+        self.assertGreater(steps[1], steps[0])
+
+    def test_shrinking_keeps_a_thin_border(self):
+        grid = [[buien.SEA, buien.BORDER, buien.LAND_DARK, buien.LAND_DARK]] * 4
+        self.assertEqual(buien.shrink_mask(grid, 2, 2), [[buien.BORDER, buien.LAND_DARK]] * 2)
+
+
 class SearchTest(unittest.TestCase):
     def setUp(self):
         config = tempfile.TemporaryDirectory()

@@ -96,6 +96,60 @@ class KindTest(unittest.TestCase):
         self.assertEqual(names, ["drizzle", "light", "light", "moderate", "heavy", "very heavy", "very heavy"])
 
 
+class TripTest(unittest.TestCase):
+    NOW = START.replace(minute=33)
+
+    def plan(self, *mm, minutes=25, now=None):
+        forecast = slots(*mm)
+        return buien.describe_trip(buien.plan_trip(forecast, now or self.NOW, minutes), forecast)
+
+    def test_dry_all_the_way(self):
+        self.assertEqual(self.plan(*[0] * 24), "leave whenever you like, no rain in sight")
+
+    def test_rain_on_the_way(self):
+        self.assertEqual(self.plan(*[0] * 8, 1, *[0] * 15), "leave by 12:45 to stay dry for 25 min")
+
+    def test_rain_now_that_stops(self):
+        self.assertEqual(self.plan(1, 1, 1, *[0] * 21), "leave from 12:45 to stay dry for 25 min")
+
+    def test_a_dry_spell_between_showers(self):
+        self.assertEqual(self.plan(1, 1, *[0] * 7, *[1] * 15), "leave between 12:40 and 12:50 to stay dry for 25 min")
+
+    def test_a_dry_spell_that_just_fits(self):
+        self.assertEqual(self.plan(1, 1, *[0] * 5, *[1] * 17), "leave at 12:40 to stay dry for 25 min")
+
+    def test_leave_right_now(self):
+        self.assertEqual(self.plan(*[0] * 5, *[1] * 19, now=START), "leave now to stay dry for 25 min")
+
+    def test_rain_in_the_slot_that_is_running(self):
+        self.assertEqual(self.plan(1, *[0] * 23), "leave from 12:35 to stay dry for 25 min")
+
+    def test_no_dry_spell_long_enough(self):
+        self.assertEqual(self.plan(*[1, 0, 0] * 8), "no dry 25 min before 14:30")
+
+    def test_longer_than_the_forecast(self):
+        with self.assertRaisesRegex(buien.BuienError, "reaches only until 14:30, so a trip can take at most 117 minutes"):
+            self.plan(*[0] * 24, minutes=120)
+
+    def test_the_trip_is_told_below_the_summary(self):
+        forecast = slots(1, 1, *[0] * 7, *[1] * 15)
+        trip = buien.plan_trip(forecast, self.NOW, 25)
+        text = plain(buien.render(GENT, forecast, self.NOW, False, 100, trip))
+        self.assertIn("leave between 12:40 and 12:50 to stay dry for 25 min", text)
+
+    def test_a_trip_that_cannot_be_made_is_not_green(self):
+        forecast = slots(*[1, 0, 0] * 8)
+        trip = buien.plan_trip(forecast, self.NOW, 25)
+        text = buien.render(GENT, forecast, self.NOW, True, 100, trip)
+        self.assertNotIn(f"38;5;{buien.TRIP_COLOR}m", text)
+        self.assertIn("no dry 25 min before 14:30", plain(text))
+
+    def test_minutes_are_required(self):
+        for argv in (["--trip"], ["--trip", "gent"], ["--trip", "0"], ["--trip", "²"], ["--trip", "99999999999999"]):
+            with self.assertRaisesRegex(buien.BuienError, "say how many minutes"):
+                buien.parse_args(argv)
+
+
 class ChartTest(unittest.TestCase):
     def render(self, forecast, width=100, color=False):
         now = START.replace(minute=33)
@@ -472,7 +526,7 @@ class CompletionTest(unittest.TestCase):
         self.assertEqual(completed - {"--help"}, documented)
         for flag in buien.FLAGS:
             for name in filter(None, (flag.short, flag.long)):
-                buien.parse_args([name])
+                buien.parse_args([name, "25"] if flag.value else [name])
 
     def test_place_names_for_completion(self):
         code, out, _ = run_main("--places", "--short")
@@ -635,6 +689,38 @@ class CommandTest(unittest.TestCase):
         self.assertEqual(data["summary"], "dry until 12:35, then 5 min of light rain")
         self.assertEqual([slot["mm_per_hour"] for slot in data["forecast"]], [0, 1.5, 0])
         self.assertEqual(data["forecast"][1]["time"], START.replace(minute=35).isoformat(timespec="minutes"))
+
+    def run_trip(self, forecast, *argv):
+        class Frozen(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return START.replace(minute=33)
+
+        with mock.patch.object(buien, "lookup", return_value=GENT), \
+                mock.patch.object(buien, "fetch_forecast", return_value=forecast), \
+                mock.patch.object(buien, "datetime", Frozen):
+            return run_main("gent", "--trip", "25", *argv)
+
+    def test_trip_exits_0_when_you_can_leave_now(self):
+        code, out, _ = self.run_trip(slots(*[0] * 24), "--short")
+        self.assertEqual((code, out), (0, "leave whenever you like, no rain in sight\n"))
+
+    def test_trip_exits_2_when_you_have_to_wait(self):
+        code, out, _ = self.run_trip(slots(1, 1, 1, *[0] * 21), "--short")
+        self.assertEqual((code, out), (2, "leave from 12:45 to stay dry for 25 min\n"))
+
+    def test_trip_exits_0_without_short_so_a_prompt_stays_calm(self):
+        code, _, _ = self.run_trip(slots(1, 1, 1, *[0] * 21), "--json")
+        self.assertEqual(code, 0)
+
+    def test_trip_in_json(self):
+        _, out, _ = self.run_trip(slots(1, 1, *[0] * 7, *[1] * 15), "--json")
+        trip = json.loads(out)["trip"]
+        self.assertEqual(trip["minutes"], 25)
+        self.assertFalse(trip["leave_now"])
+        self.assertEqual(trip["earliest"], START.replace(minute=40).isoformat(timespec="minutes"))
+        self.assertEqual(trip["latest"], START.replace(minute=50).isoformat(timespec="minutes"))
+        self.assertEqual(trip["summary"], "leave between 12:40 and 12:50 to stay dry for 25 min")
 
     def test_color_follows_the_flags_then_the_environment_then_the_terminal(self):
         def color(*argv, env=None, terminal=False):

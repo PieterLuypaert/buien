@@ -23,6 +23,14 @@ chmod +x ~/.local/bin/buien
 
 Run `buien`, or `buien -h` for every option.
 
+## When to leave
+
+`buien --trip 25` tells you when to leave to stay dry on a 25-minute ride, such as "leave between 15:20 and 15:30 to stay dry for 25 min", and draws that dry stretch in green on the chart's time axis. With `--short` it exits with 0 when you can leave right now and with 2 when you cannot, so a script can decide for you:
+
+```sh
+buien --trip 20 --short >/dev/null && echo "go now" || echo "wait a bit"
+```
+
 ## Tab completion
 
 buien completes its options and your saved places. Add the line for your shell to its startup file:

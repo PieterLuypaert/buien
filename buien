@@ -548,8 +548,29 @@ def chart_rows(slots, cell, paint):
     return rows
 
 
-def axis(slots, cell):
-    return "".join(("┬" if slot.time.minute % 30 == 0 else "─") + "─" * (cell - 1) for slot in slots)
+def axis(slots, cell, window=range(0)):
+    """The time axis with a tick every half hour; the slots in window drawn heavy."""
+    line = ""
+    for index, slot in enumerate(slots):
+        tick, rule = ("┯", "━") if index in window else ("┬", "─")
+        line += (tick if slot.time.minute % 30 == 0 else rule) + rule * (cell - 1)
+    return line
+
+
+def trip_window(slots, trip):
+    """The indices of the dry stretch to travel in, from the earliest departure until the rain comes back."""
+    if trip is None or trip.earliest is None:
+        return range(0)
+    end = trip.latest + timedelta(minutes=trip.minutes) if trip.latest else slots[-1].time + STEP
+    spanned = [index for index, slot in enumerate(slots) if slot.time < end and slot.time + STEP > trip.earliest]
+    return range(spanned[0], spanned[-1] + 1)
+
+
+def axis_line(slots, cell, paint, trip):
+    window = trip_window(slots, trip)
+    line = axis(slots, cell, window)
+    start, end = window.start * cell, window.stop * cell
+    return paint.dim(line[:start]) + paint.color(line[start:end], TRIP_COLOR) + paint.dim(line[end:])
 
 
 def time_labels(slots, cell):
@@ -576,7 +597,7 @@ def render(place, slots, now, color, width, trip=None):
     gap = max(2, len(slots) * cell - visible_len(title) - visible_len(key))
     lines = ["", f"  {title}{' ' * gap}{key}".rstrip(), ""]
     lines += [f"  {row}" for row in chart_rows(slots, cell, paint)]
-    lines.append(f"  {paint.dim(axis(slots, cell))}")
+    lines.append(f"  {axis_line(slots, cell, paint, trip)}")
     lines.append(f"  {paint.dim(time_labels(slots, cell))}")
     lines += ["", f"  {paint.bold(summarize(slots))}"]
     if trip:

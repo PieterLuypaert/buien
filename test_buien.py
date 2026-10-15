@@ -131,15 +131,21 @@ class TripTest(unittest.TestCase):
         with self.assertRaisesRegex(buien.BuienError, "reaches only until 14:30, so a trip can take at most 117 minutes"):
             self.plan(*[0] * 24, minutes=120)
 
-    def test_the_trip_is_told_below_the_summary(self):
+    def test_the_trip_is_drawn_on_the_axis(self):
         forecast = slots(1, 1, *[0] * 7, *[1] * 15)
         trip = buien.plan_trip(forecast, self.NOW, 25)
+        window = buien.trip_window(forecast, trip)
+        self.assertEqual(window, range(2, 9))
+        line = buien.axis(forecast, 2, window)
+        self.assertEqual(set(line[4:18]), {"━", "┯"})
+        self.assertNotIn("━", line[:4] + line[18:])
         text = plain(buien.render(GENT, forecast, self.NOW, False, 100, trip))
         self.assertIn("leave between 12:40 and 12:50 to stay dry for 25 min", text)
 
-    def test_a_trip_that_cannot_be_made_is_not_green(self):
+    def test_a_trip_that_cannot_be_made_is_not_drawn_or_green(self):
         forecast = slots(*[1, 0, 0] * 8)
         trip = buien.plan_trip(forecast, self.NOW, 25)
+        self.assertEqual(buien.trip_window(forecast, trip), range(0))
         text = buien.render(GENT, forecast, self.NOW, True, 100, trip)
         self.assertNotIn(f"38;5;{buien.TRIP_COLOR}m", text)
         self.assertIn("no dry 25 min before 14:30", plain(text))

@@ -15,6 +15,8 @@
                       --save to save the one you pick
   buien --places      list your saved places, with --short only their names
   buien --forget work forget a saved place
+  buien --trip 25     when to leave to stay dry on a 25-minute trip; with
+                      --short it exits with 2 when you cannot leave right now
   buien --short       only the summary, for a status bar or prompt
   buien --json        the forecast as JSON, for scripts
   buien --color       colour even when the output is not a terminal, such as
@@ -59,6 +61,7 @@ CACHE_FRESH = timedelta(minutes=5)
 CACHE_KEEP = timedelta(hours=3)
 SHORT_GAP = 1
 ROWS = 3
+TRIP_COLOR = 71
 BLOCKS = " ▁▂▃▄▅▆▇█"
 COORDS = re.compile(r"^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$")
 ANSI = re.compile(r"\033\[[0-9;]*m")
@@ -67,7 +70,8 @@ HOME = "home"
 Place = namedtuple("Place", "name lat lon")
 Slot = namedtuple("Slot", "time mm")
 Kind = namedtuple("Kind", "limit name label adjective color")
-Flag = namedtuple("Flag", "short long about")
+Flag = namedtuple("Flag", "short long about value choices", defaults=("", ()))
+Trip = namedtuple("Trip", "minutes earliest latest leave_now")
 Cached = namedtuple("Cached", "fetched slots")
 
 KINDS = [
@@ -78,6 +82,7 @@ KINDS = [
     Kind(math.inf, "very heavy rain", "very heavy", "very heavy", 162),
 ]
 
+SHELLS = ("bash", "fish", "zsh")
 FLAGS = [
     Flag("-h", "--help", "every option"),
     Flag("", "--version", "the version of buien"),
@@ -86,13 +91,13 @@ FLAGS = [
     Flag("", "--search", "list every match for a place and pick one"),
     Flag("", "--places", "list your saved places"),
     Flag("", "--forget", "forget a saved place"),
+    Flag("", "--trip", "when to leave to stay dry for so many minutes", "minutes"),
     Flag("-s", "--short", "only the summary"),
     Flag("", "--json", "the forecast as JSON"),
     Flag("", "--color", "colour even when the output is not a terminal"),
     Flag("", "--no-color", "no colour at all"),
-    Flag("", "--completions", "tab completion for bash, fish or zsh"),
+    Flag("", "--completions", "tab completion for bash, fish or zsh", "shell", SHELLS),
 ]
-SHELLS = ("bash", "fish", "zsh")
 
 
 class BuienError(Exception):
@@ -109,6 +114,7 @@ class Options:
     list_places: bool = False
     short: bool = False
     as_json: bool = False
+    trip: Optional[int] = None
     color: Optional[bool] = None
     completions: Optional[str] = None
     help: bool = False
@@ -440,6 +446,43 @@ def describe_spell(slots, spell, horizon):
     return f"dry until {dry_until}, then {duration((end - start) * 5)} of {kind}"
 
 
+def plan_trip(slots, now, minutes):
+    """The first moment to leave and stay dry for minutes, and the last moment to leave in that same dry spell."""
+    length = timedelta(minutes=minutes)
+    horizon = slots[-1].time + STEP
+    if now + length > horizon:
+        reach = int((horizon - now).total_seconds() // 60)
+        raise BuienError(f"the forecast reaches only until {clock(horizon)}, so a trip can take at most {reach} minutes")
+    for start in [now] + [slot.time for slot in slots if slot.time > now]:
+        if start + length > horizon:
+            break
+        if all(slot.mm <= 0 for slot in slots_during(slots, start, start + length)):
+            rain = next((slot.time for slot in slots if slot.time >= start and slot.mm > 0), None)
+            return Trip(minutes, start, rain and rain - length, start == now)
+    return Trip(minutes, None, None, False)
+
+
+def slots_during(slots, start, end):
+    return [slot for slot in slots if slot.time < end and slot.time + STEP > start]
+
+
+def describe_trip(trip, slots):
+    span = duration(trip.minutes)
+    if trip.earliest is None:
+        return f"no dry {span} before {clock(slots[-1].time + STEP)}"
+    first = clock(trip.earliest)
+    if trip.latest is None:
+        if trip.leave_now:
+            return "leave whenever you like, no rain in sight"
+        return f"leave from {first} to stay dry for {span}"
+    last = clock(trip.latest)
+    if trip.leave_now:
+        return f"leave now to stay dry for {span}" if last == first else f"leave by {last} to stay dry for {span}"
+    if first == last:
+        return f"leave at {first} to stay dry for {span}"
+    return f"leave between {first} and {last} to stay dry for {span}"
+
+
 def peak(slots):
     """'heaviest at 13:25: 2.4 mm per hour', or None when it stays dry."""
     top = max(slots, key=lambda slot: slot.mm)
@@ -505,8 +548,29 @@ def chart_rows(slots, cell, paint):
     return rows
 
 
-def axis(slots, cell):
-    return "".join(("┬" if slot.time.minute % 30 == 0 else "─") + "─" * (cell - 1) for slot in slots)
+def axis(slots, cell, window=range(0)):
+    """The time axis with a tick every half hour; the slots in window drawn heavy."""
+    line = ""
+    for index, slot in enumerate(slots):
+        tick, rule = ("┯", "━") if index in window else ("┬", "─")
+        line += (tick if slot.time.minute % 30 == 0 else rule) + rule * (cell - 1)
+    return line
+
+
+def trip_window(slots, trip):
+    """The indices of the dry stretch to travel in, from the earliest departure until the rain comes back."""
+    if trip is None or trip.earliest is None:
+        return range(0)
+    end = trip.latest + timedelta(minutes=trip.minutes) if trip.latest else slots[-1].time + STEP
+    spanned = [index for index, slot in enumerate(slots) if slot.time < end and slot.time + STEP > trip.earliest]
+    return range(spanned[0], spanned[-1] + 1)
+
+
+def axis_line(slots, cell, paint, trip):
+    window = trip_window(slots, trip)
+    line = axis(slots, cell, window)
+    start, end = window.start * cell, window.stop * cell
+    return paint.dim(line[:start]) + paint.color(line[start:end], TRIP_COLOR) + paint.dim(line[end:])
 
 
 def time_labels(slots, cell):
@@ -525,7 +589,7 @@ def legend(slots, paint):
     return "  ".join(f"{kind.label} {paint.color('█', kind.color)}" for kind in KINDS if kind in present)
 
 
-def render(place, slots, now, color, width):
+def render(place, slots, now, color, width, trip=None):
     paint = Paint(color)
     cell = 2 if 2 + 2 * len(slots) + 4 <= width else 1
     title = f"{paint.bold(place.name)} {paint.dim('· ' + clock(now))}"
@@ -533,9 +597,12 @@ def render(place, slots, now, color, width):
     gap = max(2, len(slots) * cell - visible_len(title) - visible_len(key))
     lines = ["", f"  {title}{' ' * gap}{key}".rstrip(), ""]
     lines += [f"  {row}" for row in chart_rows(slots, cell, paint)]
-    lines.append(f"  {paint.dim(axis(slots, cell))}")
+    lines.append(f"  {axis_line(slots, cell, paint, trip)}")
     lines.append(f"  {paint.dim(time_labels(slots, cell))}")
     lines += ["", f"  {paint.bold(summarize(slots))}"]
+    if trip:
+        advice = describe_trip(trip, slots)
+        lines.append(f"  {paint.bold(paint.color(advice, TRIP_COLOR) if trip.earliest else advice)}")
     strongest = peak(slots)
     if strongest:
         lines.append(f"  {paint.dim(strongest)}")
@@ -543,14 +610,23 @@ def render(place, slots, now, color, width):
     return "\n".join(lines)
 
 
-def to_json(place, slots):
-    return {
+def to_json(place, slots, trip=None):
+    data = {
         "place": place.name,
         "lat": place.lat,
         "lon": place.lon,
         "summary": summarize(slots),
         "forecast": [{"time": slot.time.isoformat(timespec="minutes"), "mm_per_hour": slot.mm} for slot in slots],
     }
+    if trip:
+        data["trip"] = {
+            "minutes": trip.minutes,
+            "summary": describe_trip(trip, slots),
+            "leave_now": trip.leave_now,
+            "earliest": trip.earliest and trip.earliest.isoformat(timespec="minutes"),
+            "latest": trip.latest and trip.latest.isoformat(timespec="minutes"),
+        }
+    return data
 
 
 def completion_script(shell):
@@ -565,8 +641,7 @@ def zsh_completion():
     specs = []
     for flag in FLAGS:
         for name in filter(None, (flag.short, flag.long)):
-            arguments = f":shell:({' '.join(SHELLS)})" if name == "--completions" else ""
-            specs.append(f"    '{name}[{flag.about}]{arguments}' \\")
+            specs.append(f"    '{name}[{flag.about}]{zsh_value(flag)}' \\")
     return "\n".join([
         "#compdef buien",
         "_buien() {",
@@ -580,15 +655,27 @@ def zsh_completion():
     ])
 
 
+def zsh_value(flag):
+    """What zsh offers after a flag that takes a value: its choices, or only the value's name."""
+    if flag.choices:
+        return f":{flag.value}:({' '.join(flag.choices)})"
+    return f":{flag.value}: " if flag.value else ""
+
+
 def bash_completion():
     names = " ".join(name for flag in FLAGS for name in (flag.short, flag.long) if name)
-    shells = " ".join(SHELLS)
+    arms = []
+    for flag in FLAGS:
+        if flag.value:
+            choices = " ".join(flag.choices)
+            arms.append(f'    {flag.long}) COMPREPLY=($(compgen -W "{choices}" -- "$cur")); return ;;')
     return "\n".join([
         "_buien() {",
         '  local cur="${COMP_WORDS[COMP_CWORD]}"',
-        '  if [[ "${COMP_WORDS[COMP_CWORD-1]}" == --completions ]]; then',
-        f'    COMPREPLY=($(compgen -W "{shells}" -- "$cur"))',
-        '  elif [[ "$cur" == -* ]]; then',
+        '  case "${COMP_WORDS[COMP_CWORD-1]}" in',
+        *arms,
+        "  esac",
+        '  if [[ "$cur" == -* ]]; then',
         f'    COMPREPLY=($(compgen -W "{names}" -- "$cur"))',
         "  else",
         "    local IFS=$'\\n'",
@@ -603,7 +690,7 @@ def fish_completion():
     lines = ["complete -c buien -f"]
     for flag in FLAGS:
         short = f" -s {flag.short[1:]}" if flag.short else ""
-        arguments = f" -x -a '{' '.join(SHELLS)}'" if flag.long == "--completions" else ""
+        arguments = f" -x -a '{' '.join(flag.choices)}'" if flag.choices else " -x" if flag.value else ""
         lines.append(f"complete -c buien{short} -l {flag.long[2:]}{arguments} -d '{flag.about}'")
     lines.append("complete -c buien -a '(buien --places --short 2>/dev/null)' -d 'saved place'")
     return "\n".join(lines)
@@ -644,11 +731,19 @@ def parse_args(argv):
             options.color = arg == "--color"
         elif arg == "--completions":
             options.completions = next(args, "")
+        elif arg == "--trip":
+            options.trip = parse_minutes(next(args, ""))
         elif arg.startswith("-") and not COORDS.match(arg):
             raise BuienError(f"unknown option {arg}, see buien -h")
         else:
             options.words.append(arg)
     return options
+
+
+def parse_minutes(text):
+    if not (text.isascii() and text.isdigit()) or not 0 < int(text) <= 9999:
+        raise BuienError("say how many minutes the trip takes, e.g. buien --trip 25")
+    return int(text)
 
 
 def run(options):
@@ -674,13 +769,18 @@ def run(options):
         return 0
     now = datetime.now().astimezone()
     slots = fetch_forecast(place, now)
+    trip = plan_trip(slots, now, options.trip) if options.trip else None
+    show(options, place, slots, now, trip)
+    return 2 if trip and options.short and not trip.leave_now else 0
+
+
+def show(options, place, slots, now, trip):
     if options.as_json:
-        print(json.dumps(to_json(place, slots), ensure_ascii=False, indent=2))
+        print(json.dumps(to_json(place, slots, trip), ensure_ascii=False, indent=2))
     elif options.short:
-        print(summarize(slots))
+        print(describe_trip(trip, slots) if trip else summarize(slots))
     else:
-        print(render(place, slots, now, use_color(options), shutil.get_terminal_size().columns))
-    return 0
+        print(render(place, slots, now, use_color(options), shutil.get_terminal_size().columns, trip))
 
 
 def main(argv=None):

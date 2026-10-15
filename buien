@@ -31,7 +31,9 @@
 In the live screen the left and right arrows or the scroll wheel move
 through the hours and pause the map there, space plays it again, up and
 down go through your saved places, / searches a place, s saves it, r
-fetches again and q quits.
+fetches again and q quits. + and - zoom the map in and out around the
+place on screen, h, j, k and l or a drag with the mouse move it, and c
+brings it back to the place.
 Piped into another command, buien prints the chart as text.
 
 Saved places, home among them, are kept in ~/.config/buien/places.json.
@@ -249,19 +251,22 @@ MAP_MAX_WIDTH = 264
 RADAR_BOUNDS = (49.5, 54.8, 0.0, 10.0)
 
 
-def shrink_mask(grid, width, height):
-    """grid scaled down to width x height: a border wherever one crosses a pixel, else what covers most of it."""
-    rows = []
-    for top, bottom in spans(len(grid), height):
+def shrink_mask(grid, width, height, window=None):
+    """grid scaled to width x height, or the window (left, top, width, height) of that: a border wherever one
+    crosses a pixel, else what covers most of it."""
+    left, top, columns, rows = window or (0, 0, width, height)
+    across = spans(len(grid[0]), width)[left:left + columns]
+    result = []
+    for y_top, y_bottom in spans(len(grid), height)[top:top + rows]:
         row = []
-        for left, right in spans(len(grid[0]), width):
+        for x_left, x_right in across:
             counts = [0, 0, 0, 0]
-            for line in grid[top:bottom]:
-                for value in line[left:right]:
+            for line in grid[y_top:y_bottom]:
+                for value in line[x_left:x_right]:
                     counts[value] += 1
             row.append(BORDER if counts[BORDER] else counts.index(max(counts[:BORDER])))
-        rows.append(row)
-    return rows
+        result.append(row)
+    return result
 
 
 def spans(size, parts):
@@ -269,14 +274,19 @@ def spans(size, parts):
     return [(part * size // parts, max(part * size // parts + 1, (part + 1) * size // parts)) for part in range(parts)]
 
 
-@functools.lru_cache(maxsize=4)
-def map_mask(width, height):
-    """Sea, land and borders of the radar map at width x height pixels."""
+@functools.lru_cache(maxsize=1)
+def mask_grid():
+    """MAP_MASK unpacked: rows of SEA, LAND_DARK, LAND_LIGHT or BORDER."""
     full_width, full_height = MAP_MASK_SIZE
     packed = zlib.decompress(base64.b64decode(MAP_MASK))
     values = [byte >> shift & 3 for byte in packed for shift in (6, 4, 2, 0)]
-    grid = [values[y * full_width:(y + 1) * full_width] for y in range(full_height)]
-    return shrink_mask(grid, width, height)
+    return [values[y * full_width:(y + 1) * full_width] for y in range(full_height)]
+
+
+@functools.lru_cache(maxsize=16)
+def map_mask(width, height, window=None):
+    """Sea, land and borders of the radar map at width x height pixels, or of the window on it."""
+    return shrink_mask(mask_grid(), width, height, window)
 
 
 def mercator(lat):
@@ -289,6 +299,22 @@ def map_position(place, width, height):
     x = int((place.lon - west) / (east - west) * width)
     y = int((mercator(north) - mercator(place.lat)) / (mercator(north) - mercator(south)) * height)
     return (x, y) if 0 <= x < width and 0 <= y < height else None
+
+
+View = namedtuple("View", "zoom left top width height")
+
+
+def whole_view(width, height):
+    return View(1, 0, 0, width, height)
+
+
+def view_position(place, view):
+    """The pixel where place lies in the view's window on the map at its zoom, or None when it lies outside."""
+    position = map_position(place, view.width * view.zoom, view.height * view.zoom)
+    if position is None:
+        return None
+    x, y = position[0] - view.left, position[1] - view.top
+    return (x, y) if 0 <= x < view.width and 0 <= y < view.height else None
 
 
 def lookup(text, choose=False):
@@ -917,21 +943,21 @@ def map_cell(top, bottom, color):
     return Cell(pixel_shade(max(top, bottom, key=pixel_rank)), None, None)
 
 
-def map_lines(frame, mask, marks, paint):
-    """The frame over the map in half blocks, with the places marked on top."""
+def map_lines(frame, mask, marks, paint, view=None):
+    """The frame over the map in half blocks, with the places marked on top; frame and mask are the view's window."""
     width, height = len(mask[0]), len(mask)
     rows = []
     for y in range(0, height - 1, 2):
         rows.append([map_cell(map_pixel(frame, mask, x, y), map_pixel(frame, mask, x, y + 1), paint.enabled) for x in range(width)])
-    place_marks(rows, marks, width, height)
+    place_marks(rows, marks, view or whole_view(width, height))
     return [join_cells(cells, paint) for cells in rows]
 
 
-def place_marks(rows, marks, width, height):
-    """A dot for every place, then labels, the place on screen first, each beside its dot where no other one is."""
+def place_marks(rows, marks, view):
+    """A dot for every place in view, then labels, the place on screen first, each beside its dot where no other one is."""
     placed = []
     for mark in sorted(marks, key=lambda mark: not mark.here):
-        position = map_position(mark.place, width, height)
+        position = view_position(mark.place, view)
         if position and position[1] // 2 < len(rows):
             x, row = position[0], position[1] // 2
             rows[row][x] = Cell("●", mark_color(mark), rows[row][x].bg)
@@ -965,16 +991,25 @@ def join_cells(cells, paint):
     return "".join(f"\033[38;5;{fg};48;5;{bg}m" + "".join(cell.char for cell in run) for (fg, bg), run in runs) + "\033[0m"
 
 
-def render_map(frame, now, marks, paint):
-    """The title with the frame's time and the kinds of rain on it, then the map."""
-    mask = map_mask(len(frame.rows[0]) // 4, len(frame.rows))
+def render_map(frame, now, marks, paint, view=None):
+    """The title with the frame's time, the zoom and the kinds of rain in view, then the view's window on the map."""
+    view = view or whole_view(len(frame.rows[0]) // 4, len(frame.rows))
+    mask = map_mask(view.width * view.zoom, view.height * view.zoom, (view.left, view.top, view.width, view.height))
+    window = crop(frame, view)
     minutes = round((frame.time - now).total_seconds() / 60)
     when = "now" if abs(minutes) < 5 else f"in {duration(minutes)}" if minutes > 0 else f"{duration(-minutes)} ago"
-    title = f"{paint.bold('Radar')} {paint.dim(f'· {clock(frame.time)} · {when}')}"
-    key = kinds_legend(kinds_on(frame), paint) or paint.dim("no rain on the radar")
-    gap = max(2, len(mask[0]) - visible_len(title) - visible_len(key))
+    zoom = f" · {view.zoom}x" if view.zoom > 1 else ""
+    title = f"{paint.bold('Radar')} {paint.dim(f'· {clock(frame.time)} · {when}{zoom}')}"
+    key = kinds_legend(kinds_on(window), paint) or paint.dim("no rain in view" if view.zoom > 1 else "no rain on the radar")
+    gap = max(2, view.width - visible_len(title) - visible_len(key))
     lines = ["", f"  {title}{' ' * gap}{key}".rstrip(), ""]
-    return lines + [f"  {line}" for line in map_lines(frame, mask, marks, paint)]
+    return lines + [f"  {line}" for line in map_lines(window, mask, marks, paint, view)]
+
+
+def crop(frame, view):
+    """The part of a frame, the whole map at the view's zoom, inside the view's window."""
+    start, end = view.left * 4, (view.left + view.width) * 4
+    return Frame(frame.time, [row[start:end] for row in frame.rows[view.top:view.top + view.height]])
 
 
 def saved_marks(here):
@@ -1028,7 +1063,9 @@ def nearest(items, moment):
     return min(range(len(items)), key=lambda index: abs(items[index].time - moment))
 
 
-LIVE_KEYS = "←→ time  space play  ↑↓ place  / search  s save  r refresh  q quit"
+LIVE_KEYS = "←→ time  space play  ↑↓ place  +- zoom  hjkl/drag move  / search  s save  r refresh  q quit"
+MAX_ZOOM = 4
+MOVE_KEYS = {"h": (-1, 0), "l": (1, 0), "k": (0, -1), "j": (0, 1)}
 MAP_RESERVED = 21
 BESIDE_RESERVED = 6
 MIN_MAP_ROWS = 6
@@ -1037,8 +1074,8 @@ BESIDE_MIN_MAP = 50
 Layout = namedtuple("Layout", "beside map_size")
 MENU_KEYS = "↑↓ choose  enter open  esc back"
 LIVE_TICK = 0.5
-ENTER_SCREEN = "\033[?1049h\033[?25l\033[?1000h\033[?1006h"
-LEAVE_SCREEN = "\033[?1006l\033[?1000l\033[?25h\033[?1049l"
+ENTER_SCREEN = "\033[?1049h\033[?25l\033[?1000h\033[?1002h\033[?1006h"
+LEAVE_SCREEN = "\033[?1006l\033[?1002l\033[?1000l\033[?25h\033[?1049l"
 KEY_NAMES = {
     "\033[A": "up", "\033OA": "up", "\033[B": "down", "\033OB": "down",
     "\033[C": "right", "\033OC": "right", "\033[D": "left", "\033OD": "left",
@@ -1048,7 +1085,7 @@ KEY_NAMES = {
 KEYS = re.compile(r"\033\[<[0-9;]*[Mm]|\033\[[0-9;]*[A-Za-z~]|\033O[A-Za-z]|\033[^\[O\033]|\033|.", re.DOTALL)
 OLD_MOUSE = re.compile(rb"\033\[M(.)(.)(.)", re.DOTALL)
 CUT_SEQUENCE = re.compile(rb"\033(\[<?[0-9;]*|\[M.{0,2}|O)?$", re.DOTALL)
-MOUSE = re.compile(r"\033\[<(\d+);\d+;\d+[Mm]")
+MOUSE = re.compile(r"\033\[<(\d+);(\d+);(\d+)([Mm])")
 WHEEL = {64: "wheel-up", 65: "wheel-down"}
 
 
@@ -1058,10 +1095,16 @@ def parse_keys(text):
 
 
 def key_name(key):
+    """A key's name; the mouse gives wheel-up, wheel-down, press x y, drag x y, release or mouse."""
     mouse = MOUSE.fullmatch(key)
-    if mouse:
-        return WHEEL.get(int(mouse[1]), "mouse")
-    return KEY_NAMES.get(key, key)
+    if not mouse:
+        return KEY_NAMES.get(key, key)
+    button, x, y, action = int(mouse[1]), mouse[2], mouse[3], mouse[4]
+    if button in WHEEL:
+        return WHEEL[button]
+    if action == "m" or button == 3:
+        return "release"
+    return {0: f"press {x} {y}", 32: f"drag {x} {y}"}.get(button, "mouse")
 
 
 def read_keys(fd):
@@ -1118,30 +1161,49 @@ class Loaded:
 
 
 class Radar:
-    """The radar frames the live screen plays: loaded for the terminal's size, and again every five minutes."""
+    """The radar frames the live screen plays: the whole map at a zoom, loaded again every five minutes."""
 
     def __init__(self, fetch=None):
         self.fetch = fetch or fetch_radar
         self.frames = None
         self.error = None
-        self.size = None
+        self.viewport = None
+        self.zoom = 1
         self.loaded_at = None
+        self.retry_at = None
+        self.tried = None
 
-    def due(self, now, size):
-        return self.frames is None or self.size != size or not (self.loaded_at and timedelta(0) <= now - self.loaded_at < RADAR_FRESH)
+    def due(self, now, viewport, zoom):
+        """True when the frames should be loaded: none yet, for another view, five minutes old, or a retry is up."""
+        if self.error is not None and self.tried == (viewport, zoom):
+            return now >= self.retry_at
+        if not isinstance(self.frames, list) or self.loaded_at is None:
+            return True
+        return (self.viewport, self.zoom) != (viewport, zoom) or not timedelta(0) <= now - self.loaded_at < RADAR_FRESH
 
-    def load(self, now, size):
-        """Loads the frames; when that fails, frames that still fit stay, and the next try is a minute away."""
+    def load(self, now, viewport, zoom):
+        """Loads the map at zoom times viewport; when that fails, frames already here for this viewport stay, and
+        it tries again in a minute."""
+        self.tried = (viewport, zoom)
         try:
-            frames = self.fetch(*size)
+            frames = self.fetch(viewport[0] * zoom, viewport[1] * zoom)
         except BuienError as error:
-            self.error = error
-            if not (isinstance(self.frames, list) and self.size == size):
-                self.frames = error
-            self.loaded_at = now - RADAR_FRESH + RADAR_RETRY
-        else:
-            self.frames, self.error, self.loaded_at = frames, None, now
-        self.size = size
+            self.error, self.retry_at = error, now + RADAR_RETRY
+            if not (isinstance(self.frames, list) and self.viewport == viewport):
+                self.frames, self.viewport, self.zoom = error, viewport, zoom
+            return
+        self.frames, self.viewport, self.zoom, self.loaded_at = frames, viewport, zoom, now
+        self.error = self.retry_at = None
+
+    def reload(self):
+        self.loaded_at = self.error = self.retry_at = None
+
+    @property
+    def window(self):
+        """The size on screen the frames were loaded for, from the frames themselves; None without frames."""
+        if not isinstance(self.frames, list):
+            return None
+        return len(self.frames[0].rows[0]) // 4 // self.zoom, len(self.frames[0].rows) // self.zoom
 
     def note(self):
         """What to tell about a reload that failed while older frames stay on screen."""
@@ -1177,6 +1239,10 @@ class Live:
         self.step = 0
         self.resized = None
         self.drawn = (None, [])
+        self.zoom = 1
+        self.center = None
+        self.dragging = None
+        self.map_area = None
 
     @property
     def tab(self):
@@ -1189,14 +1255,14 @@ class Live:
         wanted = live_layout(size.columns, size.lines).map_size if size else None
         if not wanted:
             return False
-        if not self.radar.due(now, wanted) or not self.settled(now, wanted):
+        if not self.radar.due(now, wanted, self.zoom) or not self.settled(now, wanted):
             return False
-        self.radar.load(now, wanted)
+        self.radar.load(now, wanted, self.zoom)
         return True
 
     def settled(self, now, wanted):
         """True when the radar has no frames yet, or the terminal has kept this new size for a moment."""
-        if not isinstance(self.radar.frames, list) or self.radar.size == wanted:
+        if not isinstance(self.radar.frames, list) or self.radar.viewport == wanted:
             return True
         if self.resized is None or self.resized[0] != wanted:
             self.resized = (wanted, now)
@@ -1238,12 +1304,14 @@ class Live:
         else:
             self.tabs.append(Tab("", place))
             self.index = len(self.tabs) - 1
-        self.cursor = 0
+        self.cursor, self.center = 0, None
 
     def key(self, key):
         """Handles one key; False when it asks to quit."""
         self.message = ""
-        if self.prompt:
+        if key == "release":
+            self.dragging = None
+        elif self.prompt:
             self.prompt_key(key)
         elif self.menu:
             self.menu_key(key)
@@ -1255,6 +1323,8 @@ class Live:
 
     def view_key(self, key):
         """A key on the map and the chart."""
+        if self.map_key(key):
+            return
         if key in ("left", "right", "wheel-up", "wheel-down"):
             self.playing = False
             self.move_cursor(-1 if key in ("left", "wheel-up") else 1)
@@ -1262,15 +1332,80 @@ class Live:
             self.toggle_play()
         elif key in ("up", "down", "tab", "shift-tab"):
             self.index = (self.index + (-1 if key in ("up", "shift-tab") else 1)) % len(self.tabs)
-            self.cursor = 0
+            self.cursor, self.center = 0, None
         elif key == "r":
             self.loaded.pop(self.index, None)
-            self.radar.loaded_at = None
+            self.radar.reload()
             self.fresh = True
         elif key == "/":
             self.prompt = Prompt("search")
         elif key == "s":
             self.ask_name()
+
+    def map_key(self, key):
+        """Zooming and moving the map; True when key was one of those."""
+        if key in ("+", "="):
+            self.zoom_by(2)
+        elif key == "-":
+            self.zoom_by(0.5)
+        elif key in MOVE_KEYS:
+            width, height = self.radar.window or (0, 0)
+            self.move_view(MOVE_KEYS[key][0] * (width // 4), MOVE_KEYS[key][1] * (height // 4))
+        elif key == "c":
+            self.center = None
+        elif key.startswith(("press ", "drag ")):
+            self.drag(key)
+        else:
+            return False
+        return True
+
+    def zoom_by(self, factor):
+        """Zooms in or out a step, from the whole map to MAX_ZOOM."""
+        zoom = int(self.zoom * factor)
+        if zoom < 1 or zoom > MAX_ZOOM:
+            return
+        self.zoom = zoom
+        if zoom == 1:
+            self.center = None
+
+    def view(self, window, zoom):
+        """The window on the map at zoom: around the spot moved to, else around the place on screen."""
+        width, height = window
+        full_width, full_height = width * zoom, height * zoom
+        if self.center:
+            x, y = self.center[0] * full_width, self.center[1] * full_height
+        else:
+            x, y = map_position(self.tab.place, full_width, full_height) or (full_width / 2, full_height / 2)
+        left = round(min(max(x - width / 2, 0), full_width - width))
+        top = round(min(max(y - height / 2, 0), full_height - height))
+        return View(zoom, left, top, width, height)
+
+    def move_view(self, dx, dy):
+        """Moves the zoomed map on screen dx, dy pixels, as far as its edges."""
+        if self.radar.zoom == 1 or self.radar.window is None:
+            return
+        view = self.view(self.radar.window, self.radar.zoom)
+        full_width, full_height = view.width * view.zoom, view.height * view.zoom
+        x = min(max(view.left + view.width / 2 + dx, view.width / 2), full_width - view.width / 2)
+        y = min(max(view.top + view.height / 2 + dy, view.height / 2), full_height - view.height / 2)
+        self.center = (x / full_width, y / full_height)
+
+    def drag(self, key):
+        """A drag that starts on the map moves it along under the pointer, two pixels a row."""
+        kind, x, y = key.split()
+        x, y = int(x), int(y)
+        if kind == "press":
+            self.dragging = (x, y) if self.on_map(x, y) else None
+        elif self.dragging:
+            self.move_view(self.dragging[0] - x, (self.dragging[1] - y) * 2)
+            self.dragging = (x, y)
+
+    def on_map(self, x, y):
+        """True when the cell at x, y, counted from 1 as the mouse does, is part of the map on screen."""
+        if self.map_area is None:
+            return False
+        left, top, columns, rows = self.map_area
+        return left <= x - 1 < left + columns and top <= y - 1 < top + rows
 
     def toggle_play(self):
         """Pauses the map, or plays it on from the frame on screen."""
@@ -1366,10 +1501,20 @@ class Live:
             layout = live_layout(width, height)
             chart = self.chart_lines(now, chart_width(layout, width) if layout.map_size else width, paint)
             room = height - len(bottom) - 1 - (0 if layout.beside else len(chart))
-            body = compose(self.map_lines(now, paint, room) if layout.map_size else [], chart, layout, width)
+            shown = self.map_lines(now, paint, room) if layout.map_size else []
+            self.map_area = self.area_of(shown, layout, width)
+            body = compose(shown, chart, layout, width)
         lines = ([self.tab_line(paint)] + body)[:max(0, height - len(bottom))]
         lines += [""] * (height - len(bottom) - len(lines)) + bottom
         return [fit(line, width) for line in lines[-height:]]
+
+    def area_of(self, shown, layout, width):
+        """Where the map's pixels sit on screen as (left, top, columns, rows), counted from 0; None without a map."""
+        window = self.radar.window
+        if window is None or len(shown) <= 3:
+            return None
+        left = 2 if layout.beside else max(0, (width - layout.map_size[0] - 2) // 2) + 2
+        return left, 4, window[0], len(shown) - 3
 
     def tab_line(self, paint):
         labels = []
@@ -1402,9 +1547,10 @@ class Live:
             return ["", f"  {paint.bold('Radar')} {paint.dim(str(frames))}"]
         index = self.frame_index()
         marks = tuple(Mark(tab.label, tab.place, number == self.index) for number, tab in enumerate(self.tabs))
-        key = (id(frames), index, marks, paint.enabled, clock(now))
+        view = self.view(self.radar.window, self.radar.zoom)
+        key = (id(frames), index, marks, paint.enabled, clock(now), view)
         if self.drawn[0] != key:
-            self.drawn = (key, render_map(frames[index], now, marks, paint))
+            self.drawn = (key, render_map(frames[index], now, marks, paint, view))
         return self.drawn[1][:room]
 
     def menu_lines(self, paint):

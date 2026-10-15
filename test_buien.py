@@ -570,6 +570,8 @@ class CompletionTest(unittest.TestCase):
 
 
 BRUSSEL = buien.Place("Brussel", 50.85, 4.35)
+MONS = buien.Place("Bergen, Henegouwen", 50.45, 3.95)
+BERGEN_NH = buien.Place("Bergen, Noord-Holland", 52.67, 4.7)
 
 
 class LiveCase(unittest.TestCase):
@@ -723,6 +725,63 @@ class LiveTest(LiveCase):
         live = run_live.call_args.args[0]
         self.assertEqual([tab.label for tab in live.tabs], ["home", "Brussel"])
         self.assertEqual(live.index, 1)
+
+
+class LiveSearchTest(LiveCase):
+    def test_search_opens_a_single_match_right_away(self):
+        self.live.search = mock.Mock(return_value=[MONS])
+        self.press("/", *"mons", "enter")
+        self.live.search.assert_called_with("mons")
+        self.assertEqual(self.live.tab.place, MONS)
+        self.assertEqual(self.screen()[0].rstrip(), "  home  work [Bergen]")
+
+    def test_several_matches_ask_which_one(self):
+        self.live.search = mock.Mock(return_value=[MONS, BERGEN_NH])
+        self.press("/", *"bergen", "enter")
+        lines = self.screen()
+        self.assertIn("Which one?", "\n".join(lines))
+        self.assertIn("  > Bergen, Henegouwen", lines)
+        self.assertEqual(lines[-1], " " + buien.MENU_KEYS)
+        self.press("down", "enter")
+        self.assertEqual(self.live.tab.place, BERGEN_NH)
+
+    def test_typing_in_the_prompt(self):
+        self.assertEqual(self.press("/", "g", "q", "backspace", "e"), [True] * 5)
+        self.assertEqual(self.screen()[-1], " search: ge█")
+
+    def test_escape_leaves_the_prompt_and_the_menu_without_quitting(self):
+        self.live.search = mock.Mock(return_value=[MONS, BERGEN_NH])
+        self.assertEqual(self.press("/", "esc"), [True, True])
+        self.assertIsNone(self.live.prompt)
+        self.press("/", *"bergen", "enter", "esc")
+        self.assertEqual(self.live.menu, [])
+        self.assertEqual(self.live.tab.place, GENT)
+
+    def test_a_search_that_finds_nothing_says_so(self):
+        self.live.search = mock.Mock(side_effect=buien.BuienError("no place found called 'xyzzy'"))
+        self.press("/", *"xyzzy", "enter")
+        self.assertEqual(self.screen()[-2], " no place found called 'xyzzy'")
+
+    def test_save_a_place_found_by_search(self):
+        self.live.search = mock.Mock(return_value=[MONS])
+        self.press("/", *"bergen", "enter", "s", *"Mons", "enter")
+        self.assertEqual(buien.load_places()["mons"], MONS)
+        self.assertEqual(self.live.tab.label, "mons")
+        self.assertIn("is saved as mons", self.screen()[-2])
+
+    def test_a_saved_place_is_not_saved_again(self):
+        self.press("s")
+        self.assertIsNone(self.live.prompt)
+        self.assertEqual(self.screen()[-2], " Gent is saved as home")
+        self.press("right")
+        self.assertEqual(self.screen()[-1], " " + buien.LIVE_KEYS)
+        self.assertNotIn("saved as", "\n".join(self.screen()))
+
+    def test_a_save_that_fails_says_why(self):
+        self.live.search = mock.Mock(return_value=[MONS])
+        with mock.patch.object(buien, "write_places", side_effect=PermissionError("read-only file system")):
+            self.press("/", *"bergen", "enter", "s", *"mons", "enter")
+        self.assertEqual(self.screen()[-2], " read-only file system")
 
 
 class SearchTest(unittest.TestCase):

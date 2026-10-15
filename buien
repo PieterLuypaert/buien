@@ -18,7 +18,7 @@
   buien --trip 25     when to leave to stay dry on a 25-minute trip; with
                       --short it exits with 2 when you cannot leave right now
   buien --live        full screen and kept up to date: the arrows move through
-                      the hours and your saved places
+                      the hours and your saved places, / searches, s saves
   buien --short       only the summary, for a status bar or prompt
   buien --json        the forecast as JSON, for scripts
   buien --color       colour even when the output is not a terminal, such as
@@ -250,13 +250,18 @@ def write_atomic(path, text):
 
 
 def save_place(name, place):
+    print(remember_place(name, place), file=sys.stderr)
+    return place
+
+
+def remember_place(name, place):
+    """Saves place under name and returns the sentence that says so."""
     name = name.lower()
     places = load_places()
     places[name] = place
     write_places(places)
     shortcut = "plain buien" if name == HOME else f"buien {name}"
-    print(f"{place.name} is saved as {name}, from now on {shortcut} is enough", file=sys.stderr)
-    return place
+    return f"{place.name} is saved as {name}, from now on {shortcut} is enough"
 
 
 def forget_place(name):
@@ -282,6 +287,13 @@ def print_places(names_only=False):
 
 def home_first(places):
     return sorted(places, key=lambda name: (name != HOME, name))
+
+
+def matching_places(text):
+    """Every place called text, or the one place at text's coordinates."""
+    if COORDS.match(text):
+        return [lookup(text)]
+    return [to_place(result) for result in find_places(text)]
 
 
 def ask_home():
@@ -667,7 +679,8 @@ def to_json(place, slots, trip=None):
     return data
 
 
-LIVE_KEYS = "←→ time  ↑↓ place  r refresh  q quit"
+LIVE_KEYS = "←→ time  ↑↓ place  / search  s save  r refresh  q quit"
+MENU_KEYS = "↑↓ choose  enter open  esc back"
 LIVE_TICK = 0.5
 ENTER_SCREEN = "\033[?1049h\033[?25l"
 LEAVE_SCREEN = "\033[?25h\033[?1049l"
@@ -738,17 +751,28 @@ class Loaded:
     note: str = ""
 
 
-class Live:
-    """What buien --live shows: a tab per place and a cursor over the chart."""
+@dataclass
+class Prompt:
+    label: str
+    text: str = ""
 
-    def __init__(self, tabs, trip_minutes=None, fetch=None):
+
+class Live:
+    """What buien --live shows: a tab per place, a cursor over the chart, and a prompt or a menu when asked."""
+
+    def __init__(self, tabs, trip_minutes=None, fetch=None, search=None):
         self.tabs = tabs
         self.index = 0
         self.trip_minutes = trip_minutes
         self.fetch = fetch or fetch_forecast
+        self.search = search or matching_places
         self.cursor = 0
         self.loaded = {}
         self.fresh = False
+        self.prompt = None
+        self.menu = []
+        self.choice = 0
+        self.message = ""
 
     @property
     def tab(self):
@@ -794,7 +818,12 @@ class Live:
 
     def key(self, key):
         """Handles one key; False when it asks to quit."""
-        if key in ("q", "esc"):
+        self.message = ""
+        if self.prompt:
+            self.prompt_key(key)
+        elif self.menu:
+            self.menu_key(key)
+        elif key in ("q", "esc"):
             return False
         elif key in ("left", "right"):
             self.move_cursor(-1 if key == "left" else 1)
@@ -804,6 +833,10 @@ class Live:
         elif key == "r":
             self.loaded.pop(self.index, None)
             self.fresh = True
+        elif key == "/":
+            self.prompt = Prompt("search")
+        elif key == "s":
+            self.ask_name()
         return True
 
     def move_cursor(self, step):
@@ -811,12 +844,62 @@ class Live:
         if loaded and isinstance(loaded.slots, list):
             self.cursor = max(0, min(len(loaded.slots) - 1, self.cursor + step))
 
+    def prompt_key(self, key):
+        if key == "esc":
+            self.prompt = None
+        elif key == "backspace":
+            self.prompt.text = self.prompt.text[:-1]
+        elif key == "enter":
+            prompt, self.prompt = self.prompt, None
+            self.submit(prompt)
+        elif len(key) == 1 and key.isprintable():
+            self.prompt.text += key
+
+    def submit(self, prompt):
+        text = prompt.text.strip()
+        if not text:
+            return
+        try:
+            if prompt.label == "save as":
+                self.save(text)
+                return
+            found = self.search(text)
+        except (BuienError, OSError) as error:
+            self.message = str(error)
+            return
+        if len(found) == 1:
+            self.open(found[0])
+        else:
+            self.menu, self.choice = found, 0
+
+    def menu_key(self, key):
+        if key == "esc":
+            self.menu = []
+        elif key in ("up", "down"):
+            self.choice = (self.choice + (1 if key == "down" else -1)) % len(self.menu)
+        elif key == "enter":
+            place, self.menu = self.menu[self.choice], []
+            self.open(place)
+
+    def ask_name(self):
+        if self.tab.name:
+            self.message = f"{self.tab.place.name} is saved as {self.tab.name}"
+        else:
+            self.prompt = Prompt("save as")
+
+    def save(self, name):
+        self.message = remember_place(name, self.tab.place)
+        for tab in self.tabs:
+            if tab.name == name.lower():
+                tab.name = ""
+        self.tab.name = name.lower()
+
     def screen(self, now, width, height, color):
         """Every line of the terminal, each cut to its width, with a note and the keys at the bottom."""
         paint = Paint(color)
-        body = self.chart_lines(now, width, paint)
+        body = self.menu_lines(paint) if self.menu else self.chart_lines(now, width, paint)
         loaded = self.loaded.get(self.index)
-        note = loaded.note if loaded else ""
+        note = self.message or (loaded.note if loaded else "")
         bottom = [f" {note}", self.bottom_line(paint)] if note else [self.bottom_line(paint)]
         lines = ([self.tab_line(paint)] + body)[:max(0, height - len(bottom))]
         lines += [""] * (height - len(bottom) - len(lines)) + bottom
@@ -842,8 +925,16 @@ class Live:
         cursor = min(self.cursor, len(loaded.slots) - 1)
         return render(self.tab.place, loaded.slots, now, paint.enabled, width, loaded.trip, cursor).split("\n")
 
+    def menu_lines(self, paint):
+        lines = ["", f"  {paint.bold('Which one?')}", ""]
+        for index, place in enumerate(self.menu):
+            lines.append(f"  {paint.bold('> ' + place.name)}" if index == self.choice else f"    {place.name}")
+        return lines
+
     def bottom_line(self, paint):
-        return paint.dim(f" {LIVE_KEYS}")
+        if self.prompt:
+            return f" {self.prompt.label}: {self.prompt.text}█"
+        return paint.dim(f" {MENU_KEYS if self.menu else LIVE_KEYS}")
 
 
 def live_mode(options):

@@ -13,12 +13,14 @@
   buien --search bergen
                       list every Bergen and pick one, also with --home or
                       --save to save the one you pick
-  buien --places      list your saved places
+  buien --places      list your saved places, with --short only their names
   buien --forget work forget a saved place
   buien --short       only the summary, for a status bar or prompt
   buien --json        the forecast as JSON, for scripts
   buien --color       colour even when the output is not a terminal, such as
                       in watch -c buien --color; --no-color for none at all
+  buien --completions zsh
+                      tab completion for zsh, bash or fish, see the README
   buien --version     the version of buien
 
 Saved places, home among them, are kept in ~/.config/buien/places.json.
@@ -65,6 +67,7 @@ HOME = "home"
 Place = namedtuple("Place", "name lat lon")
 Slot = namedtuple("Slot", "time mm")
 Kind = namedtuple("Kind", "limit name label adjective color")
+Flag = namedtuple("Flag", "short long about")
 Cached = namedtuple("Cached", "fetched slots")
 
 KINDS = [
@@ -74,6 +77,22 @@ KINDS = [
     Kind(10, "heavy rain", "heavy", "heavy", 26),
     Kind(math.inf, "very heavy rain", "very heavy", "very heavy", 162),
 ]
+
+FLAGS = [
+    Flag("-h", "--help", "every option"),
+    Flag("", "--version", "the version of buien"),
+    Flag("", "--home", "save a place as home"),
+    Flag("", "--save", "save a place under a name of your own"),
+    Flag("", "--search", "list every match for a place and pick one"),
+    Flag("", "--places", "list your saved places"),
+    Flag("", "--forget", "forget a saved place"),
+    Flag("-s", "--short", "only the summary"),
+    Flag("", "--json", "the forecast as JSON"),
+    Flag("", "--color", "colour even when the output is not a terminal"),
+    Flag("", "--no-color", "no colour at all"),
+    Flag("", "--completions", "tab completion for bash, fish or zsh"),
+]
+SHELLS = ("bash", "fish", "zsh")
 
 
 class BuienError(Exception):
@@ -91,6 +110,7 @@ class Options:
     short: bool = False
     as_json: bool = False
     color: Optional[bool] = None
+    completions: Optional[str] = None
     help: bool = False
     version: bool = False
 
@@ -231,15 +251,15 @@ def forget_place(name):
     print(f"forgot {name}", file=sys.stderr)
 
 
-def print_places():
+def print_places(names_only=False):
     places = load_places()
-    if not places:
+    if not places and not names_only:
         print("no saved places yet, save one with buien --home <place> or buien --save <name> <place>")
         return
-    width = max(map(len, places))
+    width = max(map(len, places), default=0)
     for name in sorted(places, key=lambda name: (name != HOME, name)):
         place = places[name]
-        print(f"{name.ljust(width)}  {place.name} ({place.lat:.2f}, {place.lon:.2f})")
+        print(name if names_only else f"{name.ljust(width)}  {place.name} ({place.lat:.2f}, {place.lon:.2f})")
 
 
 def ask_home():
@@ -530,6 +550,62 @@ def to_json(place, slots):
     }
 
 
+def completion_script(shell):
+    """The script that teaches a shell buien's options and your saved places."""
+    scripts = {"bash": bash_completion, "fish": fish_completion, "zsh": zsh_completion}
+    if shell not in scripts:
+        raise BuienError(f"say which shell to complete for: {', '.join(SHELLS)}")
+    return scripts[shell]()
+
+
+def zsh_completion():
+    specs = []
+    for flag in FLAGS:
+        for name in filter(None, (flag.short, flag.long)):
+            arguments = f":shell:({' '.join(SHELLS)})" if name == "--completions" else ""
+            specs.append(f"    '{name}[{flag.about}]{arguments}' \\")
+    return "\n".join([
+        "#compdef buien",
+        "_buien() {",
+        "  local -a places",
+        '  places=(${(f)"$(buien --places --short 2>/dev/null)"})',
+        "  _arguments \\",
+        *specs,
+        "    '*:place:compadd -a places'",
+        "}",
+        'if [[ "$funcstack[1]" == _buien ]]; then _buien "$@"; else compdef _buien buien; fi',
+    ])
+
+
+def bash_completion():
+    names = " ".join(name for flag in FLAGS for name in (flag.short, flag.long) if name)
+    shells = " ".join(SHELLS)
+    return "\n".join([
+        "_buien() {",
+        '  local cur="${COMP_WORDS[COMP_CWORD]}"',
+        '  if [[ "${COMP_WORDS[COMP_CWORD-1]}" == --completions ]]; then',
+        f'    COMPREPLY=($(compgen -W "{shells}" -- "$cur"))',
+        '  elif [[ "$cur" == -* ]]; then',
+        f'    COMPREPLY=($(compgen -W "{names}" -- "$cur"))',
+        "  else",
+        "    local IFS=$'\\n'",
+        '    COMPREPLY=($(compgen -W "$(buien --places --short 2>/dev/null)" -- "$cur"))',
+        "  fi",
+        "}",
+        "complete -F _buien buien",
+    ])
+
+
+def fish_completion():
+    lines = ["complete -c buien -f"]
+    for flag in FLAGS:
+        short = f" -s {flag.short[1:]}" if flag.short else ""
+        arguments = f" -x -a '{' '.join(SHELLS)}'" if flag.long == "--completions" else ""
+        lines.append(f"complete -c buien{short} -l {flag.long[2:]}{arguments} -d '{flag.about}'")
+    lines.append("complete -c buien -a '(buien --places --short 2>/dev/null)' -d 'saved place'")
+    return "\n".join(lines)
+
+
 def use_color(options):
     """--color or --no-color first, then NO_COLOR, then FORCE_COLOR, else only in a terminal."""
     if options.color is not None:
@@ -541,7 +617,8 @@ def use_color(options):
 
 def parse_args(argv):
     options = Options()
-    for arg in argv:
+    args = iter(argv)
+    for arg in args:
         if arg in ("-h", "--help"):
             options.help = True
         elif arg == "--version":
@@ -562,6 +639,8 @@ def parse_args(argv):
             options.as_json = True
         elif arg in ("--color", "--no-color"):
             options.color = arg == "--color"
+        elif arg == "--completions":
+            options.completions = next(args, "")
         elif arg.startswith("-") and not COORDS.match(arg):
             raise BuienError(f"unknown option {arg}, see buien -h")
         else:
@@ -576,8 +655,11 @@ def run(options):
     if options.version:
         print(f"buien {__version__}")
         return 0
+    if options.completions is not None:
+        print(completion_script(options.completions))
+        return 0
     if options.list_places:
-        print_places()
+        print_places(names_only=options.short)
         return 0
     if options.forget:
         if not options.words:

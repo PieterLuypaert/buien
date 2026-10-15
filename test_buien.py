@@ -6,6 +6,8 @@ import io
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -446,6 +448,56 @@ BERGEN = {"results": [
     {"name": "Bergen", "country_code": "NL", "country": "Nederland", "admin1": "Noord-Holland",
      "admin2": "Bergen (NH.)", "latitude": 52.67, "longitude": 4.70},
 ]}
+
+
+class CompletionTest(unittest.TestCase):
+    def setUp(self):
+        config = tempfile.TemporaryDirectory()
+        self.addCleanup(config.cleanup)
+        mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": config.name}).start()
+        self.addCleanup(mock.patch.stopall)
+
+    def test_every_flag_in_the_help_is_completed_and_understood(self):
+        documented = set(re.findall(r"--[a-z-]+", buien.__doc__))
+        completed = {flag.long for flag in buien.FLAGS}
+        self.assertEqual(completed - {"--help"}, documented)
+        for flag in buien.FLAGS:
+            for name in filter(None, (flag.short, flag.long)):
+                buien.parse_args([name])
+
+    def test_place_names_for_completion(self):
+        code, out, _ = run_main("--places", "--short")
+        self.assertEqual((code, out), (0, ""))
+        buien.write_places({"work": GENT, "home": GENT, "sint niklaas": GENT})
+        code, out, _ = run_main("--places", "--short")
+        self.assertEqual(out, "home\nsint niklaas\nwork\n")
+
+    def test_an_unknown_shell(self):
+        code, _, err = run_main("--completions", "tcsh")
+        self.assertEqual(code, 1)
+        self.assertIn("say which shell to complete for: bash, fish, zsh", err)
+
+    @unittest.skipUnless(shutil.which("bash"), "needs bash")
+    def test_bash_completes_options_shells_and_saved_places(self):
+        script = buien.completion_script("bash")
+        probe = (
+            'buien() { printf "home\\nwork\\nsint niklaas\\n"; }\n'
+            f"{script}\n"
+            'for words in "buien w" "buien s" "buien --sh" "buien --completions z"; do\n'
+            '  read -ra COMP_WORDS <<< "$words"; COMP_CWORD=$(( ${#COMP_WORDS[@]} - 1 ))\n'
+            '  _buien; (IFS=,; echo "${COMPREPLY[*]}")\n'
+            "done\n"
+        )
+        out = subprocess.run(["bash", "-c", probe], capture_output=True, text=True, check=True).stdout
+        self.assertEqual(out.splitlines(), ["work", "sint niklaas", "--short", "zsh"])
+
+    def test_scripts_are_valid_for_their_shell(self):
+        for shell in buien.SHELLS:
+            with self.subTest(shell=shell):
+                if not shutil.which(shell):
+                    self.skipTest(f"needs {shell}")
+                result = subprocess.run([shell, "-n"], input=buien.completion_script(shell), capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
 
 
 class SearchTest(unittest.TestCase):

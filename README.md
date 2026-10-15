@@ -22,3 +22,13 @@ chmod +x ~/.local/bin/buien
 ```
 
 Run `buien`, or `buien -h` for every option.
+
+## Tab completion
+
+buien completes its options and your saved places. Add the line for your shell to its startup file:
+
+```sh
+eval "$(buien --completions zsh)"     # ~/.zshrc, after compinit
+eval "$(buien --completions bash)"    # ~/.bashrc
+buien --completions fish > ~/.config/fish/completions/buien.fish
+```

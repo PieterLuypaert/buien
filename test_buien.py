@@ -5,6 +5,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -424,6 +425,11 @@ class CommandTest(unittest.TestCase):
         code, out, _ = run_main("--version")
         self.assertEqual(code, 0)
         self.assertEqual(out, f"buien {buien.__version__}\n")
+
+    def test_the_package_has_the_same_version(self):
+        with open(os.path.join(HERE, "pyproject.toml")) as pyproject:
+            version = re.search(r'^version = "(.+)"$', pyproject.read(), re.MULTILINE)[1]
+        self.assertEqual(version, buien.__version__)
 
     def test_requests_name_buien_and_its_version(self):
         response = mock.MagicMock()
